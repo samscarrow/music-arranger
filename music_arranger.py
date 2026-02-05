@@ -250,7 +250,8 @@ class MusicArranger:
         )
 
         # 6. Scale constraint — keep all notes diatonic
-        solver.add_scale_constraint(constraints['key_root'], constraints['scale_type'])
+        solver.add_scale_constraint(constraints['key_root'], constraints['scale_type'],
+                                     exclude_voices=[melody_voice])
 
         # 7. Cadence
         cadence_type = constraints.get('cadence', 'none')
@@ -265,6 +266,7 @@ class MusicArranger:
                 solver.add_cadence_constraint(
                     constraints['key_root'], constraints['scale_type'],
                     cadence_type, start, melody_voice=melody_voice,
+                    exclude_voices=[melody_voice],
                 )
                 print(f"Applied {cadence_type} cadence at step {start}")
 
@@ -278,7 +280,8 @@ class MusicArranger:
             chord_info = diatonic.get(numeral)
             if chord_info:
                 absolute_root = (constraints['key_root'] + chord_info['root_degree']) % 12
-                solver.add_harmonic_constraint(step, absolute_root, chord_info['quality'])
+                solver.add_harmonic_constraint(step, absolute_root, chord_info['quality'],
+                                               exclude_voices=[melody_voice])
                 # Prefer root in bass
                 solver.add_doubling_preference(step, absolute_root)
 

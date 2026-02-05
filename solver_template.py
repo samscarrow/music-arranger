@@ -46,25 +46,34 @@ class ArrangerSolver:
 
         print(f"Problem Initialized: {len(voice_names)} voices, {num_steps} steps.")
 
-    def add_harmonic_constraint(self, step_index, root_note, chord_type):
+    def add_harmonic_constraint(self, step_index, root_note, chord_type, exclude_voices=None):
         """
         Constraints all voices at a specific step to belong to a specific chord.
+        Voices in exclude_voices use a wide MIDI range (24-96) instead of the
+        strict voice range, preventing infeasibility when a melody note is pinned
+        outside the voice's strict range.
         """
+        if exclude_voices is None:
+            exclude_voices = []
         chord_intervals = self.theory['chords'].get(chord_type) or self.theory['chords']['triads'].get(chord_type)
         if not chord_intervals:
             print(f"Warning: Chord type '{chord_type}' not found.")
             return
 
         # Calculate allowed MIDI notes (Pitch Classes)
-        # We use Modulo 12 logic. 
+        # We use Modulo 12 logic.
         # Note % 12 must equal (Root + Interval) % 12
         allowed_pcs = [(root_note + interval) % 12 for interval in chord_intervals]
-        
+
         for name in self.voice_names:
             note_var = self.voices[name][step_index]
             # Pre-compute all MIDI values in the voice's range whose pitch class is allowed
-            ranges = self.theory['voice_ranges_midi'].get(name, {'min': 36, 'max': 84})
-            allowed_values = [m for m in range(ranges['min'], ranges['max'] + 1)
+            if name in exclude_voices:
+                lo, hi = 24, 96
+            else:
+                ranges = self.theory['voice_ranges_midi'].get(name, {'min': 36, 'max': 84})
+                lo, hi = ranges['min'], ranges['max']
+            allowed_values = [m for m in range(lo, hi + 1)
                               if m % 12 in allowed_pcs]
             self.model.AddAllowedAssignments([note_var], [[v] for v in allowed_values])
 
@@ -105,12 +114,17 @@ class ArrangerSolver:
                 dist = self.model.NewIntVar(0, max_interval, f'{name}_dist_t{t}')
                 self.model.AddAbsEquality(dist, current_note - next_note)
 
-    def add_cadence_constraint(self, key_root, scale_type, cadence_type, start_step, melody_voice='soprano'):
+    def add_cadence_constraint(self, key_root, scale_type, cadence_type, start_step,
+                               melody_voice='soprano', exclude_voices=None):
         """
         Applies a cadence (chord progression) starting at start_step.
         Looks up the cadence progression, resolves each Roman numeral to an
         absolute root + chord quality, and applies harmonic constraints.
+        Voices in exclude_voices use a wide MIDI range (24-96) in harmonic
+        and soprano_on_root constraints.
         """
+        if exclude_voices is None:
+            exclude_voices = []
         cadence = self.theory['cadences'].get(cadence_type)
         if not cadence:
             print(f"Warning: Cadence type '{cadence_type}' not found.")
@@ -137,7 +151,8 @@ class ArrangerSolver:
                 continue
 
             absolute_root = (key_root + chord_info['root_degree']) % 12
-            self.add_harmonic_constraint(step, absolute_root, chord_info['quality'])
+            self.add_harmonic_constraint(step, absolute_root, chord_info['quality'],
+                                         exclude_voices=exclude_voices)
 
         # Handle soprano_on_root for perfect authentic cadence
         if cadence.get('soprano_on_root') and melody_voice in self.voices:
@@ -148,15 +163,24 @@ class ArrangerSolver:
                 if tonic_info:
                     tonic_pc = (key_root + tonic_info['root_degree']) % 12
                     mel_var = self.voices[melody_voice][last_step]
-                    ranges = self.theory['voice_ranges_midi'].get(melody_voice, {'min': 60, 'max': 84})
-                    allowed = [m for m in range(ranges['min'], ranges['max'] + 1)
+                    if melody_voice in exclude_voices:
+                        lo, hi = 24, 96
+                    else:
+                        ranges = self.theory['voice_ranges_midi'].get(melody_voice, {'min': 60, 'max': 84})
+                        lo, hi = ranges['min'], ranges['max']
+                    allowed = [m for m in range(lo, hi + 1)
                                if m % 12 == tonic_pc]
                     self.model.AddAllowedAssignments([mel_var], [[v] for v in allowed])
 
-    def add_scale_constraint(self, key_root, scale_type):
+    def add_scale_constraint(self, key_root, scale_type, exclude_voices=None):
         """
         Constrains all notes across all steps to belong to a specific scale.
+        Voices in exclude_voices use a wide MIDI range (24-96) instead of the
+        strict voice range, preventing infeasibility when a melody note is pinned
+        outside the voice's strict range.
         """
+        if exclude_voices is None:
+            exclude_voices = []
         scale_intervals = self.theory['scales'].get(scale_type)
         if not scale_intervals:
             print(f"Warning: Scale type '{scale_type}' not found.")
@@ -165,8 +189,12 @@ class ArrangerSolver:
         scale_pcs = set((key_root + degree) % 12 for degree in scale_intervals)
 
         for name in self.voice_names:
-            ranges = self.theory['voice_ranges_midi'].get(name, {'min': 36, 'max': 84})
-            allowed_values = [m for m in range(ranges['min'], ranges['max'] + 1)
+            if name in exclude_voices:
+                lo, hi = 24, 96
+            else:
+                ranges = self.theory['voice_ranges_midi'].get(name, {'min': 36, 'max': 84})
+                lo, hi = ranges['min'], ranges['max']
+            allowed_values = [m for m in range(lo, hi + 1)
                               if m % 12 in scale_pcs]
             for t in range(self.steps):
                 self.model.AddAllowedAssignments(
@@ -236,15 +264,16 @@ if __name__ == "__main__":
     solver.add_voice_leading_constraint(max_interval=7, exclude_voices=['soprano'])
 
     # Keep all notes diatonic to C major
-    solver.add_scale_constraint(key_root=0, scale_type='major')
+    solver.add_scale_constraint(key_root=0, scale_type='major', exclude_voices=['soprano'])
 
     # Apply chord constraints: I - V - IV - I
-    solver.add_harmonic_constraint(0, 0, 'major')   # C major (I)
-    solver.add_harmonic_constraint(1, 7, 'major')   # G major (V)
+    solver.add_harmonic_constraint(0, 0, 'major', exclude_voices=['soprano'])   # C major (I)
+    solver.add_harmonic_constraint(1, 7, 'major', exclude_voices=['soprano'])   # G major (V)
 
     # Plagal cadence at the end (steps 2-3): IV -> I
     solver.add_cadence_constraint(key_root=0, scale_type='major',
-                                  cadence_type='plagal', start_step=2)
+                                  cadence_type='plagal', start_step=2,
+                                  exclude_voices=['soprano'])
 
     # Prefer root in bass (use correct root per chord)
     solver.add_doubling_preference(0, 0)   # C for I
