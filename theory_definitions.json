@@ -76,6 +76,30 @@
       "v":    { "root_degree": 7,  "quality": "minor" },
       "VI":   { "root_degree": 8,  "quality": "major" },
       "VII":  { "root_degree": 10, "quality": "major" }
+    },
+    "harmonic_minor": {
+      "i":    { "root_degree": 0,  "quality": "minor" },
+      "I":    { "root_degree": 0,  "quality": "minor" },
+      "iio":  { "root_degree": 2,  "quality": "diminished" },
+      "III+": { "root_degree": 3,  "quality": "augmented" },
+      "iv":   { "root_degree": 5,  "quality": "minor" },
+      "IV":   { "root_degree": 5,  "quality": "minor" },
+      "V":    { "root_degree": 7,  "quality": "major" },
+      "vi":   { "root_degree": 8,  "quality": "major" },
+      "VI":   { "root_degree": 8,  "quality": "major" },
+      "viio": { "root_degree": 11, "quality": "diminished" }
+    },
+    "melodic_minor_ascending": {
+      "i":    { "root_degree": 0,  "quality": "minor" },
+      "I":    { "root_degree": 0,  "quality": "minor" },
+      "ii":   { "root_degree": 2,  "quality": "minor" },
+      "III+": { "root_degree": 3,  "quality": "augmented" },
+      "IV":   { "root_degree": 5,  "quality": "major" },
+      "V":    { "root_degree": 7,  "quality": "major" },
+      "vio":  { "root_degree": 9,  "quality": "diminished" },
+      "vi":   { "root_degree": 9,  "quality": "diminished" },
+      "VI":   { "root_degree": 9,  "quality": "diminished" },
+      "viio": { "root_degree": 11, "quality": "diminished" }
     }
   }
 }
