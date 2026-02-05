@@ -31,9 +31,9 @@
     "alto":    {"min": 53, "max": 74, "tessitura_min": 57, "tessitura_max": 71},
     "tenor":   {"min": 46, "max": 69, "tessitura_min": 50, "tessitura_max": 64},
     "bass":    {"min": 36, "max": 62, "tessitura_min": 40, "tessitura_max": 55},
-    "lead_barbershop": {"min": 57, "max": 74},
+    "lead": {"min": 57, "max": 74},
     "tenor_barbershop": {"min": 60, "max": 79},
-    "bari_barbershop": {"min": 50, "max": 72},
+    "baritone": {"min": 50, "max": 72},
     "bass_barbershop": {"min": 36, "max": 64}
   },
   "intervals": {
