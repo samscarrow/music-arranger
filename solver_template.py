@@ -41,7 +41,7 @@ class ArrangerSolver:
             
             for t in range(num_steps):
                 # Create a variable for Note at Time t with domain [min, max]
-                var = self.model.NewIntVar(ranges['min'], ranges['max'], f'{name}_t{t}')
+                var = self.model.NewIntVar(24, 96, f'{name}_t{t}')
                 self.voices[name].append(var)
 
         print(f"Problem Initialized: {len(voice_names)} voices, {num_steps} steps.")
