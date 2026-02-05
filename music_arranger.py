@@ -112,8 +112,8 @@ class RequestMapper:
         # Build context about available theory values
         available_scales = list(self.theory['scales'].keys())
         available_cadences = list(self.theory.get('cadences', {}).keys()) + ['none']
-        available_chords_major = list(self.theory.get('diatonic_chords', {}).get('major', {}).keys())
-        available_chords_minor = list(self.theory.get('diatonic_chords', {}).get('natural_minor', {}).keys())
+        diatonic_chords = self.theory.get('diatonic_chords', {})
+        available_chords_info = {scale: list(chords.keys()) for scale, chords in diatonic_chords.items()}
 
         system_prompt = (
             "You are a music theory assistant. Extract structured arrangement parameters "
@@ -121,11 +121,14 @@ class RequestMapper:
             "return the parameters.\n\n"
             f"Available scales: {available_scales}\n"
             f"Available cadences: {available_cadences}\n"
-            f"Available major-key Roman numerals: {available_chords_major}\n"
-            f"Available minor-key Roman numerals: {available_chords_minor}\n"
+            f"Available diatonic chords per scale: {json.dumps(available_chords_info)}\n"
             f"Number of time steps in the melody: {num_steps}\n\n"
             "Pitch class mapping: 0=C, 1=C#/Db, 2=D, 3=Eb/D#, 4=E, 5=F, "
-            "6=F#/Gb, 7=G, 8=Ab/G#, 9=A, 10=Bb/A#, 11=B"
+            "6=F#/Gb, 7=G, 8=Ab/G#, 9=A, 10=Bb/A#, 11=B\n\n"
+            "NOTE: Cadences and chord_sequence are only supported for scales with "
+            "diatonic chord definitions (major, natural_minor, harmonic_minor, "
+            "melodic_minor_ascending). For other scales, set cadence to 'none' "
+            "and leave chord_sequence empty."
         )
 
         response = self.client.messages.create(
@@ -200,6 +203,7 @@ class MusicArranger:
         request: str,
         output_path: str = 'output.musicxml',
         voice_names: list[str] | None = None,
+        melody_voice: str | None = None,
     ) -> str:
         """
         Full pipeline: parse melody -> interpret request -> solve -> export.
@@ -209,6 +213,7 @@ class MusicArranger:
             request: natural language arrangement instruction
             output_path: where to write the output MusicXML
             voice_names: list of voice names (default: SATB)
+            melody_voice: which voice carries the melody (default: first voice)
 
         Returns:
             Path to the written MusicXML file.
@@ -229,14 +234,20 @@ class MusicArranger:
         solver = ArrangerSolver(theory_file=self.theory_file)
         solver.setup_problem(num_steps, voice_names)
 
-        # 4. Pin the melody to soprano (first voice)
-        melody_voice = voice_names[0]
+        # 4. Pin the melody
+        if melody_voice is None:
+            melody_voice = voice_names[0]
+        elif melody_voice not in voice_names:
+            raise ValueError(f"melody_voice '{melody_voice}' not in voice_names {voice_names}")
         for step_idx, midi_pitch in melody_steps:
             solver.add_melodic_constraint(melody_voice, step_idx, midi_pitch)
 
         # 5. Structural constraints
         solver.add_no_crossing_constraint()
-        solver.add_voice_leading_constraint(constraints.get('voice_leading_max_interval', 7))
+        solver.add_voice_leading_constraint(
+            constraints.get('voice_leading_max_interval', 7),
+            exclude_voices=[melody_voice],
+        )
 
         # 6. Scale constraint — keep all notes diatonic
         solver.add_scale_constraint(constraints['key_root'], constraints['scale_type'])
@@ -253,7 +264,7 @@ class MusicArranger:
                     start = max(0, num_steps - prog_len)
                 solver.add_cadence_constraint(
                     constraints['key_root'], constraints['scale_type'],
-                    cadence_type, start,
+                    cadence_type, start, melody_voice=melody_voice,
                 )
                 print(f"Applied {cadence_type} cadence at step {start}")
 
@@ -306,6 +317,8 @@ if __name__ == '__main__':
     parser.add_argument('-v', '--voices', nargs='+',
                         default=['soprano', 'alto', 'tenor', 'bass'],
                         help='Voice names (default: soprano alto tenor bass)')
+    parser.add_argument('-m', '--melody-voice', default=None,
+                        help='Which voice carries the melody (default: first voice)')
     parser.add_argument('-t', '--theory', default='theory_definitions.json',
                         help='Path to theory definitions JSON')
     args = parser.parse_args()
@@ -316,5 +329,6 @@ if __name__ == '__main__':
         request=args.request,
         output_path=args.output,
         voice_names=args.voices,
+        melody_voice=args.melody_voice,
     )
     print(f"Done: {result}")

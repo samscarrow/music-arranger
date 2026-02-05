@@ -87,11 +87,16 @@ class ArrangerSolver:
                 # Upper voice must be strictly greater than lower voice (or >= if unisons allowed)
                 self.model.Add(upper >= lower)
 
-    def add_voice_leading_constraint(self, max_interval=7):
+    def add_voice_leading_constraint(self, max_interval=7, exclude_voices=None):
         """
         Minimizes big jumps. |Note_t - Note_t+1| <= max_interval.
+        Voices in exclude_voices are skipped (e.g. pinned melody voice).
         """
+        if exclude_voices is None:
+            exclude_voices = []
         for name in self.voice_names:
+            if name in exclude_voices:
+                continue
             for t in range(self.steps - 1):
                 current_note = self.voices[name][t]
                 next_note = self.voices[name][t+1]
@@ -100,7 +105,7 @@ class ArrangerSolver:
                 dist = self.model.NewIntVar(0, max_interval, f'{name}_dist_t{t}')
                 self.model.AddAbsEquality(dist, current_note - next_note)
 
-    def add_cadence_constraint(self, key_root, scale_type, cadence_type, start_step):
+    def add_cadence_constraint(self, key_root, scale_type, cadence_type, start_step, melody_voice='soprano'):
         """
         Applies a cadence (chord progression) starting at start_step.
         Looks up the cadence progression, resolves each Roman numeral to an
@@ -135,18 +140,18 @@ class ArrangerSolver:
             self.add_harmonic_constraint(step, absolute_root, chord_info['quality'])
 
         # Handle soprano_on_root for perfect authentic cadence
-        if cadence.get('soprano_on_root') and 'soprano' in self.voices:
+        if cadence.get('soprano_on_root') and melody_voice in self.voices:
             last_step = start_step + len(progression) - 1
             if last_step < self.steps:
                 # Resolve the tonic root pitch class
                 tonic_info = diatonic.get(progression[-1])
                 if tonic_info:
                     tonic_pc = (key_root + tonic_info['root_degree']) % 12
-                    sop_var = self.voices['soprano'][last_step]
-                    ranges = self.theory['voice_ranges_midi'].get('soprano', {'min': 60, 'max': 84})
+                    mel_var = self.voices[melody_voice][last_step]
+                    ranges = self.theory['voice_ranges_midi'].get(melody_voice, {'min': 60, 'max': 84})
                     allowed = [m for m in range(ranges['min'], ranges['max'] + 1)
                                if m % 12 == tonic_pc]
-                    self.model.AddAllowedAssignments([sop_var], [[v] for v in allowed])
+                    self.model.AddAllowedAssignments([mel_var], [[v] for v in allowed])
 
     def add_scale_constraint(self, key_root, scale_type):
         """
@@ -167,17 +172,19 @@ class ArrangerSolver:
                 self.model.AddAllowedAssignments(
                     [self.voices[name][t]], [[v] for v in allowed_values])
 
-    def add_doubling_preference(self, step_index, root_pc):
+    def add_doubling_preference(self, step_index, root_pc, bass_voice=None):
         """
         Soft constraint (objective) preferring the root pitch class to appear
         in the bass voice — standard SATB doubling practice.
         Adds a boolean term to the objective; call before solve().
         """
-        if 'bass' not in self.voices:
+        if bass_voice is None:
+            bass_voice = self.voice_names[-1]
+        if bass_voice not in self.voices:
             return
 
-        bass_var = self.voices['bass'][step_index]
-        ranges = self.theory['voice_ranges_midi'].get('bass', {'min': 36, 'max': 62})
+        bass_var = self.voices[bass_voice][step_index]
+        ranges = self.theory['voice_ranges_midi'].get(bass_voice, {'min': 36, 'max': 62})
         root_values = [m for m in range(ranges['min'], ranges['max'] + 1)
                        if m % 12 == root_pc]
 
@@ -185,7 +192,7 @@ class ArrangerSolver:
             return
 
         # Create a boolean indicator: is the bass on the root pitch class?
-        is_root = self.model.NewBoolVar(f'bass_root_t{step_index}')
+        is_root = self.model.NewBoolVar(f'{bass_voice}_root_t{step_index}')
         # If is_root is true, bass must be one of the root values
         self.model.AddAllowedAssignments([bass_var], [[v] for v in root_values]).OnlyEnforceIf(is_root)
         # If is_root is false, bass must NOT be one of the root values
@@ -226,7 +233,7 @@ if __name__ == "__main__":
 
     # Structural constraints
     solver.add_no_crossing_constraint()
-    solver.add_voice_leading_constraint(max_interval=7)
+    solver.add_voice_leading_constraint(max_interval=7, exclude_voices=['soprano'])
 
     # Keep all notes diatonic to C major
     solver.add_scale_constraint(key_root=0, scale_type='major')
