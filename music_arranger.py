@@ -7,6 +7,8 @@ and outputs valid MusicXML.
 
 import json
 import os
+from fractions import Fraction
+from math import gcd
 
 import anthropic
 import music21
@@ -73,27 +75,74 @@ EXTRACT_TOOL = {
 class MelodyParser:
     """Parses MusicXML or MIDI files into discrete (step_index, midi_pitch) tuples."""
 
-    def parse(self, filepath: str) -> tuple[list[tuple[int, int]], list[float]]:
+    def parse(self, filepath: str) -> tuple[list[tuple[int, int]], list[float], int]:
         """
         Parse a music file and return:
-          - steps: list of (step_index, midi_pitch)
-          - durations: list of quarterLength values per step
+          - melody_steps: list of (step_index, midi_pitch) for notes only (no rests)
+          - step_durations: list of float(grid) for every grid step
+          - total_steps: total number of grid steps
         """
         score = music21.converter.parse(filepath)
-        flat = score.flatten().notes  # Notes and Chords
+        flat = score.flatten().notesAndRests  # Notes, Chords, and Rests
 
-        steps = []
-        durations = []
-        for i, n in enumerate(flat):
-            if hasattr(n, 'pitch'):
-                midi = n.pitch.midi
+        elements = list(flat)
+        if not elements:
+            return [], [], 0
+
+        # Compute grid resolution as GCD of all durations
+        grid = self._compute_grid_from_elements(elements)
+
+        # Total steps: from offset 0 to end of last element
+        last = elements[-1]
+        end_offset = Fraction(last.offset).limit_denominator(256) + \
+                     Fraction(last.quarterLength).limit_denominator(256)
+        total_steps = int(round(float(end_offset / grid)))
+
+        melody_steps = []
+        step_durations = [float(grid)] * total_steps
+
+        for e in elements:
+            dur = Fraction(e.quarterLength).limit_denominator(256)
+            if dur <= 0:
+                continue  # skip grace notes
+
+            offset = Fraction(e.offset).limit_denominator(256)
+            start_step = int(round(float(offset / grid)))
+            span = int(round(float(dur / grid)))
+
+            if isinstance(e, music21.note.Rest):
+                continue  # rests produce no melody_steps entries
+
+            if hasattr(e, 'pitch'):
+                midi = e.pitch.midi
             else:
                 # Chord — take the highest pitch (soprano line)
-                midi = max(p.midi for p in n.pitches)
-            steps.append((i, midi))
-            durations.append(n.quarterLength)
+                midi = max(p.midi for p in e.pitches)
 
-        return steps, durations
+            # A note spanning multiple grid steps: repeat constraint at each sub-step
+            for s in range(span):
+                step_idx = start_step + s
+                if step_idx < total_steps:
+                    melody_steps.append((step_idx, midi))
+
+        return melody_steps, step_durations, total_steps
+
+    @staticmethod
+    def _compute_grid_from_elements(elements) -> Fraction:
+        """Compute the GCD of all element durations to determine grid resolution."""
+        g = Fraction(0)
+        for e in elements:
+            dur = Fraction(e.quarterLength).limit_denominator(256)
+            if dur > 0:
+                if g == 0:
+                    g = dur
+                else:
+                    # gcd of two fractions: gcd(a/b, c/d) = gcd(a*d, c*b) / (b*d)
+                    # but simpler: use numerator/denominator properties
+                    num = gcd(g.numerator * dur.denominator, dur.numerator * g.denominator)
+                    den = g.denominator * dur.denominator
+                    g = Fraction(num, den)
+        return g if g > 0 else Fraction(1)
 
 
 class RequestMapper:
@@ -157,7 +206,30 @@ class RequestMapper:
 class MusicXMLExporter:
     """Converts solver output to a music21 Score and writes MusicXML."""
 
-    def export(self, solution: dict, step_durations: list[float], filepath: str):
+    @staticmethod
+    def _merge_consecutive(midi_notes: list[int], step_durations: list[float],
+                           rest_steps: set[int]) -> list[tuple[int | None, float]]:
+        """Merge consecutive same-pitch steps (or consecutive rests) into single entries.
+
+        Returns list of (midi_or_None, total_duration) tuples.
+        """
+        merged: list[tuple[int | None, float]] = []
+        for i, (midi_val, dur) in enumerate(zip(midi_notes, step_durations)):
+            val = None if i in rest_steps else midi_val
+            if merged and merged[-1][0] == val:
+                merged[-1] = (val, merged[-1][1] + dur)
+            else:
+                merged.append((val, dur))
+        return merged
+
+    def export(
+        self,
+        solution: dict,
+        step_durations: list[float],
+        filepath: str,
+        melody_voice: str | None = None,
+        rest_steps: set[int] | None = None,
+    ):
         """
         Write a MusicXML file from the solver solution.
 
@@ -165,15 +237,29 @@ class MusicXMLExporter:
             solution: dict mapping voice_name -> list of MIDI note numbers
             step_durations: quarterLength per step
             filepath: output path (.musicxml)
+            melody_voice: which voice carries the melody (for rest insertion)
+            rest_steps: step indices where the melody has rests
         """
+        if rest_steps is None:
+            rest_steps = set()
+
         score = music21.stream.Score()
 
         for voice_name, midi_notes in solution.items():
             part = music21.stream.Part()
             part.partName = voice_name.capitalize()
 
-            for midi_val, dur in zip(midi_notes, step_durations):
-                n = music21.note.Note(midi_val)
+            is_melody = (voice_name == melody_voice)
+            merged = self._merge_consecutive(
+                midi_notes, step_durations,
+                rest_steps if is_melody else set(),
+            )
+
+            for midi_val, dur in merged:
+                if midi_val is None:
+                    n = music21.note.Rest()
+                else:
+                    n = music21.note.Note(midi_val)
                 n.quarterLength = dur
                 part.append(n)
 
@@ -222,9 +308,11 @@ class MusicArranger:
             voice_names = ['soprano', 'alto', 'tenor', 'bass']
 
         # 1. Parse melody
-        melody_steps, step_durations = self.parser.parse(melody_path)
-        num_steps = len(melody_steps)
-        print(f"Parsed {num_steps} melody notes from {melody_path}")
+        melody_steps, step_durations, num_steps = self.parser.parse(melody_path)
+        note_step_set = {idx for idx, _ in melody_steps}
+        rest_steps = set(range(num_steps)) - note_step_set
+        note_count = len(note_step_set)
+        print(f"Parsed {note_count} notes and {len(rest_steps)} rests from {melody_path}")
 
         # 2. Map NL request -> structured constraints via Claude
         constraints = self.mapper.map_request(request, num_steps=num_steps)
@@ -301,7 +389,8 @@ class MusicArranger:
             print(f"  {voice}: {names}")
 
         # 10. Export
-        self.exporter.export(solution, step_durations, output_path)
+        self.exporter.export(solution, step_durations, output_path,
+                             melody_voice=melody_voice, rest_steps=rest_steps)
         print(f"Written to {output_path}")
         return output_path
 
