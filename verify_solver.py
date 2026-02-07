@@ -227,6 +227,132 @@ def test_per_voice_leap():
     return passed
 
 
+def test_diag_melody_outside_scale():
+    """Pin soprano to F# (pc 6) in C major WITHOUT excluding soprano.
+    Expect ERROR about melody note not in scale + empty domain."""
+    print("\n=== Diagnostic Test: Melody Outside Scale ===")
+    solver = ArrangerSolver()
+    solver.setup_problem(1, ['soprano', 'alto', 'tenor', 'bass'])
+    solver.add_melodic_constraint('soprano', 0, 66)  # F#4 (pc 6)
+    # Deliberately do NOT exclude soprano from scale constraint
+    solver.add_scale_constraint(key_root=0, scale_type='major', exclude_voices=[])
+    solver.add_harmonic_constraint(0, 0, 'major', exclude_voices=[])
+
+    diagnostics = solver.validate()
+    errors = [msg for level, msg in diagnostics if level == 'ERROR']
+
+    has_melody_error = any('Melody note' in e and 'not in' in e for e in errors)
+    has_empty_domain = any('Empty domain' in e and 'soprano' in e for e in errors)
+
+    if has_melody_error and has_empty_domain:
+        print(f"PASS: Got {len(errors)} errors including melody-outside-scale and empty domain")
+        return True
+    else:
+        print(f"FAIL: Expected melody and empty domain errors, got: {errors}")
+        return False
+
+
+def test_diag_voice_leading_too_tight():
+    """Pin bass to two notes 8 semitones apart with a max_interval of 2.
+    Expect WARN about minimum jump exceeding limit."""
+    print("\n=== Diagnostic Test: Voice Leading Too Tight ===")
+    solver = ArrangerSolver()
+    solver.setup_problem(2, ['soprano', 'alto', 'tenor', 'bass'])
+    # Pin bass to C2 at step 0 and Ab2 at step 1 — 8 semitone jump
+    solver.add_melodic_constraint('bass', 0, 36)   # C2
+    solver.add_melodic_constraint('bass', 1, 44)   # Ab2
+    solver.add_voice_leading_constraint(max_interval=2)
+
+    diagnostics = solver.validate()
+    warns = [msg for level, msg in diagnostics if level == 'WARN']
+
+    has_jump_warn = any('must jump at least' in w and 'bass' in w for w in warns)
+    if has_jump_warn:
+        print(f"PASS: Got voice leading warning for bass")
+        return True
+    else:
+        print(f"FAIL: Expected voice leading warning for bass, got: {warns}")
+        return False
+
+
+def test_diag_empty_domain_conflict():
+    """Apply two harmonic constraints with non-overlapping pitch classes at the
+    same step. Expect ERROR about empty domain."""
+    print("\n=== Diagnostic Test: Empty Domain from Conflicting Constraints ===")
+    solver = ArrangerSolver()
+    solver.setup_problem(1, ['soprano', 'alto', 'tenor', 'bass'])
+    # C major (pcs 0, 4, 7) then D major (pcs 2, 6, 9) — intersection is empty
+    solver.add_harmonic_constraint(0, 0, 'major')
+    solver.add_harmonic_constraint(0, 2, 'major')
+
+    diagnostics = solver.validate()
+    errors = [msg for level, msg in diagnostics if level == 'ERROR']
+
+    has_empty = any('Empty domain' in e for e in errors)
+    if has_empty:
+        print(f"PASS: Got empty domain errors for conflicting chords")
+        return True
+    else:
+        print(f"FAIL: Expected empty domain errors, got: {errors}")
+        return False
+
+
+def test_diag_cadence_truncation():
+    """Apply a 2-step cadence starting at the last step of a 1-step problem.
+    Expect WARN about truncation."""
+    print("\n=== Diagnostic Test: Cadence Truncation ===")
+    solver = ArrangerSolver()
+    solver.setup_problem(1, ['soprano', 'alto', 'tenor', 'bass'])
+    # Authentic cadence is V-I (2 steps) but only 1 step available from start_step=0
+    solver.add_cadence_constraint(key_root=0, scale_type='major',
+                                  cadence_type='authentic', start_step=0)
+
+    diagnostics = solver.validate()
+    warns = [msg for level, msg in diagnostics if level == 'WARN']
+
+    has_truncation = any('truncated' in w.lower() for w in warns)
+    if has_truncation:
+        print(f"PASS: Got cadence truncation warning")
+        return True
+    else:
+        print(f"FAIL: Expected truncation warning, got: {warns}")
+        return False
+
+
+def test_diag_perfect_authentic_vs_melody():
+    """Pin soprano to D4 (non-tonic) at the final step of a perfect authentic
+    cadence in C major. Expect ERROR about soprano_on_root conflict."""
+    print("\n=== Diagnostic Test: Perfect Authentic Cadence vs Pinned Melody ===")
+    solver = ArrangerSolver()
+    solver.setup_problem(2, ['soprano', 'alto', 'tenor', 'bass'])
+    # Pin soprano at step 1 to D4 (MIDI 62, pc 2) — not tonic C (pc 0)
+    solver.add_melodic_constraint('soprano', 0, 64)  # E4 at step 0
+    solver.add_melodic_constraint('soprano', 1, 62)  # D4 at step 1 (non-tonic)
+    # Perfect authentic cadence V-I at steps 0-1, soprano_on_root requires
+    # soprano to be on tonic (pc 0) at step 1
+    solver.add_cadence_constraint(key_root=0, scale_type='major',
+                                  cadence_type='perfect_authentic', start_step=0,
+                                  melody_voice='soprano',
+                                  exclude_voices=['soprano'])
+
+    diagnostics = solver.validate()
+    errors = [msg for level, msg in diagnostics if level == 'ERROR']
+
+    has_conflict = any('soprano' in e.lower() and 'tonic' in e.lower() for e in errors)
+    if has_conflict:
+        print(f"PASS: Got soprano/tonic conflict error")
+        return True
+    else:
+        # The soprano_on_root constraint uses exclude_voices range [24,96],
+        # and D4(62) pc=2 is not pc=0, so the domain intersection catches it
+        has_empty = any('Empty domain' in e and 'soprano' in e for e in errors)
+        if has_empty:
+            print(f"PASS: Got empty domain error for soprano (soprano_on_root conflict detected)")
+            return True
+        print(f"FAIL: Expected soprano/tonic conflict error, got: {errors}")
+        return False
+
+
 if __name__ == "__main__":
     run_verification()
 
@@ -237,6 +363,13 @@ if __name__ == "__main__":
     results.append(("Spacing", test_spacing()))
     results.append(("Bass restriction", test_bass_restriction()))
     results.append(("Per-voice leap", test_per_voice_leap()))
+
+    # Diagnostic tests
+    results.append(("Diag: melody outside scale", test_diag_melody_outside_scale()))
+    results.append(("Diag: voice leading too tight", test_diag_voice_leading_too_tight()))
+    results.append(("Diag: empty domain conflict", test_diag_empty_domain_conflict()))
+    results.append(("Diag: cadence truncation", test_diag_cadence_truncation()))
+    results.append(("Diag: perfect auth vs melody", test_diag_perfect_authentic_vs_melody()))
 
     print("\n=== Summary ===")
     for name, passed in results:
