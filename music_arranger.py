@@ -66,6 +66,19 @@ EXTRACT_TOOL = {
                 "type": "integer",
                 "description": "Maximum semitone leap allowed between consecutive notes in a voice. Default 7.",
             },
+            "per_voice_max_interval": {
+                "type": "object",
+                "description": "Optional per-voice leap limits (e.g. {\"alto\": 4, \"tenor\": 4}). Voices not listed use voice_leading_max_interval.",
+                "additionalProperties": {"type": "integer"},
+            },
+            "enable_chord_completeness": {
+                "type": "boolean",
+                "description": "Ensure every chord tone appears in at least one voice. Default true.",
+            },
+            "enable_bass_restrictions": {
+                "type": "boolean",
+                "description": "Restrict bass to root/fifth (or chord-specific allowed tones). Default true.",
+            },
         },
         "required": ["key_root", "scale_type"],
     },
@@ -198,6 +211,9 @@ class RequestMapper:
                 params.setdefault('cadence_position', 'end')
                 params.setdefault('chord_sequence', [])
                 params.setdefault('voice_leading_max_interval', 7)
+                params.setdefault('per_voice_max_interval', None)
+                params.setdefault('enable_chord_completeness', True)
+                params.setdefault('enable_bass_restrictions', True)
                 return params
 
         raise RuntimeError("Claude did not return an apply_arrangement tool call.")
@@ -334,6 +350,7 @@ class MusicArranger:
         solver.add_no_crossing_constraint()
         solver.add_voice_leading_constraint(
             constraints.get('voice_leading_max_interval', 7),
+            per_voice_max=constraints.get('per_voice_max_interval'),
             exclude_voices=[melody_voice],
         )
 
@@ -351,14 +368,27 @@ class MusicArranger:
                     start = max(0, num_steps // 2 - prog_len // 2)
                 else:
                     start = max(0, num_steps - prog_len)
+                enable_comp = constraints.get('enable_chord_completeness', True)
+                enable_bass = constraints.get('enable_bass_restrictions', True)
+                # Skip bass restriction if melody voice is the bass
+                if melody_voice == voice_names[-1]:
+                    enable_bass = False
                 solver.add_cadence_constraint(
                     constraints['key_root'], constraints['scale_type'],
                     cadence_type, start, melody_voice=melody_voice,
                     exclude_voices=[melody_voice],
+                    ensure_completeness=enable_comp,
+                    restrict_bass=enable_bass,
                 )
                 print(f"Applied {cadence_type} cadence at step {start}")
 
         # 8. Explicit chord sequence
+        enable_comp = constraints.get('enable_chord_completeness', True)
+        enable_bass = constraints.get('enable_bass_restrictions', True)
+        if melody_voice == voice_names[-1]:
+            enable_bass = False
+        bass_voice = voice_names[-1]
+
         diatonic = self.theory.get('diatonic_chords', {}).get(constraints['scale_type'], {})
         for chord_spec in constraints.get('chord_sequence', []):
             step = chord_spec['step']
@@ -370,10 +400,23 @@ class MusicArranger:
                 absolute_root = (constraints['key_root'] + chord_info['root_degree']) % 12
                 solver.add_harmonic_constraint(step, absolute_root, chord_info['quality'],
                                                exclude_voices=[melody_voice])
+                if enable_comp:
+                    solver.add_chord_completeness_constraint(
+                        step, absolute_root, chord_info['quality'],
+                        exclude_voices=[melody_voice])
+                if enable_bass and bass_voice not in [melody_voice]:
+                    solver.add_bass_restriction_constraint(
+                        step, absolute_root, chord_info['quality'],
+                        bass_voice=bass_voice)
                 # Prefer root in bass
                 solver.add_doubling_preference(step, absolute_root)
 
-        # 9. Solve
+        # 9. Voicing quality: soft constraints
+        solver.add_unison_penalty()
+        solver.add_spacing_constraint()
+        solver.add_parallel_octave_penalty()
+
+        # 10. Solve
         print("Solving...")
         solution = solver.solve()
         if not solution:
@@ -388,7 +431,7 @@ class MusicArranger:
                 names.append(f"{pname}{octave}")
             print(f"  {voice}: {names}")
 
-        # 10. Export
+        # 11. Export
         self.exporter.export(solution, step_durations, output_path,
                              melody_voice=melody_voice, rest_steps=rest_steps)
         print(f"Written to {output_path}")

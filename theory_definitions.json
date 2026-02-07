@@ -101,5 +101,17 @@
       "VI":   { "root_degree": 9,  "quality": "diminished" },
       "viio": { "root_degree": 11, "quality": "diminished" }
     }
+  },
+  "bass_restrictions": {
+    "major": [0, 7],
+    "minor": [0, 3, 7],
+    "diminished": [0],
+    "augmented": [0, 4, 8],
+    "dominant_7th": [0, 7],
+    "major_7th": [0, 7],
+    "minor_7th": [0, 7],
+    "half_diminished_7th": [0],
+    "fully_diminished_7th": [0],
+    "minor_major_7th": [0, 7]
   }
 }

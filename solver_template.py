@@ -96,9 +96,12 @@ class ArrangerSolver:
                 # Upper voice must be strictly greater than lower voice (or >= if unisons allowed)
                 self.model.Add(upper >= lower)
 
-    def add_voice_leading_constraint(self, max_interval=7, exclude_voices=None):
+    def add_voice_leading_constraint(self, max_interval=7, per_voice_max=None,
+                                      exclude_voices=None):
         """
-        Minimizes big jumps. |Note_t - Note_t+1| <= max_interval.
+        Minimizes big jumps. |Note_t - Note_t+1| <= limit.
+        per_voice_max is an optional dict mapping voice name -> max semitone leap.
+        Voices in that dict use their specific limit; others fall back to max_interval.
         Voices in exclude_voices are skipped (e.g. pinned melody voice).
         """
         if exclude_voices is None:
@@ -106,22 +109,27 @@ class ArrangerSolver:
         for name in self.voice_names:
             if name in exclude_voices:
                 continue
+            limit = per_voice_max.get(name, max_interval) if per_voice_max else max_interval
             for t in range(self.steps - 1):
                 current_note = self.voices[name][t]
                 next_note = self.voices[name][t+1]
-                
+
                 # Absolute difference constraint
-                dist = self.model.NewIntVar(0, max_interval, f'{name}_dist_t{t}')
+                dist = self.model.NewIntVar(0, limit, f'{name}_dist_t{t}')
                 self.model.AddAbsEquality(dist, current_note - next_note)
 
     def add_cadence_constraint(self, key_root, scale_type, cadence_type, start_step,
-                               melody_voice='soprano', exclude_voices=None):
+                               melody_voice='soprano', exclude_voices=None,
+                               ensure_completeness=False, restrict_bass=False):
         """
         Applies a cadence (chord progression) starting at start_step.
         Looks up the cadence progression, resolves each Roman numeral to an
         absolute root + chord quality, and applies harmonic constraints.
         Voices in exclude_voices use a wide MIDI range (24-96) in harmonic
         and soprano_on_root constraints.
+
+        If ensure_completeness is True, also applies chord completeness at each step.
+        If restrict_bass is True, also applies bass note restrictions at each step.
         """
         if exclude_voices is None:
             exclude_voices = []
@@ -134,6 +142,8 @@ class ArrangerSolver:
         if not diatonic:
             print(f"Warning: Scale type '{scale_type}' not in diatonic_chords.")
             return
+
+        bass_voice = self.voice_names[-1] if self.voice_names else None
 
         progression = cadence['progression']
         for i, numeral in enumerate(progression):
@@ -153,6 +163,16 @@ class ArrangerSolver:
             absolute_root = (key_root + chord_info['root_degree']) % 12
             self.add_harmonic_constraint(step, absolute_root, chord_info['quality'],
                                          exclude_voices=exclude_voices)
+
+            if ensure_completeness:
+                self.add_chord_completeness_constraint(
+                    step, absolute_root, chord_info['quality'],
+                    exclude_voices=exclude_voices)
+
+            if restrict_bass and bass_voice and bass_voice not in exclude_voices:
+                self.add_bass_restriction_constraint(
+                    step, absolute_root, chord_info['quality'],
+                    bass_voice=bass_voice)
 
         # Handle soprano_on_root for perfect authentic cadence
         if cadence.get('soprano_on_root') and melody_voice in self.voices:
@@ -229,6 +249,225 @@ class ArrangerSolver:
         self.model.AddAllowedAssignments([bass_var], [[v] for v in non_root]).OnlyEnforceIf(is_root.Not())
         self._objective_terms.append(is_root)
 
+    def add_unison_penalty(self, weight=1):
+        """
+        Soft constraint penalising two voices landing on the exact same MIDI pitch
+        at any step.  Each unison occurrence reduces the objective by `weight`.
+        """
+        for t in range(self.steps):
+            for i in range(len(self.voice_names)):
+                for j in range(i + 1, len(self.voice_names)):
+                    vi = self.voices[self.voice_names[i]][t]
+                    vj = self.voices[self.voice_names[j]][t]
+                    is_unison = self.model.NewBoolVar(
+                        f'unison_{self.voice_names[i]}_{self.voice_names[j]}_t{t}')
+                    # is_unison == 1  =>  vi == vj
+                    self.model.Add(vi == vj).OnlyEnforceIf(is_unison)
+                    # is_unison == 0  =>  vi != vj
+                    self.model.Add(vi != vj).OnlyEnforceIf(is_unison.Not())
+                    for _ in range(weight):
+                        self._objective_terms.append(is_unison.Not())
+
+    def add_spacing_constraint(self, max_total_spread=19, max_adjacent_upper=12,
+                               weight=1):
+        """
+        Soft constraint penalising wide voicings.
+
+        - Total spread: penalise when highest – lowest voice > max_total_spread
+        - Adjacent upper voices: for each adjacent pair except the lowest, penalise
+          when the gap > max_adjacent_upper
+        Relies on the no-crossing constraint ensuring voices[i] >= voices[i+1].
+        """
+        for t in range(self.steps):
+            top = self.voices[self.voice_names[0]][t]
+            bot = self.voices[self.voice_names[-1]][t]
+            spread = self.model.NewIntVar(0, 72, f'spread_t{t}')
+            self.model.Add(spread == top - bot)
+            is_wide = self.model.NewBoolVar(f'wide_spread_t{t}')
+            self.model.Add(spread > max_total_spread).OnlyEnforceIf(is_wide)
+            self.model.Add(spread <= max_total_spread).OnlyEnforceIf(is_wide.Not())
+            for _ in range(weight):
+                self._objective_terms.append(is_wide.Not())
+
+            # Adjacent upper voices (all pairs except the lowest pair)
+            for i in range(len(self.voice_names) - 2):
+                upper = self.voices[self.voice_names[i]][t]
+                lower = self.voices[self.voice_names[i + 1]][t]
+                gap = self.model.NewIntVar(0, 72,
+                    f'adj_gap_{self.voice_names[i]}_{self.voice_names[i+1]}_t{t}')
+                self.model.Add(gap == upper - lower)
+                is_far = self.model.NewBoolVar(
+                    f'adj_far_{self.voice_names[i]}_{self.voice_names[i+1]}_t{t}')
+                self.model.Add(gap > max_adjacent_upper).OnlyEnforceIf(is_far)
+                self.model.Add(gap <= max_adjacent_upper).OnlyEnforceIf(is_far.Not())
+                for _ in range(weight):
+                    self._objective_terms.append(is_far.Not())
+
+    def add_chord_completeness_constraint(self, step_index, root_note, chord_type,
+                                          exclude_voices=None):
+        """
+        Hard constraint: every pitch class in the chord must appear in at least one
+        voice at the given step.
+
+        exclude_voices affects range selection only — excluded voices still
+        participate in completeness but use range [24, 96].
+        """
+        if exclude_voices is None:
+            exclude_voices = []
+        chord_intervals = (self.theory['chords'].get(chord_type)
+                           or self.theory['chords']['triads'].get(chord_type))
+        if not chord_intervals:
+            print(f"Warning: Chord type '{chord_type}' not found (completeness).")
+            return
+
+        for interval in chord_intervals:
+            pc = (root_note + interval) % 12
+            indicators = []
+            for name in self.voice_names:
+                var = self.voices[name][step_index]
+                if name in exclude_voices:
+                    lo, hi = 24, 96
+                else:
+                    ranges = self.theory['voice_ranges_midi'].get(
+                        name, {'min': 36, 'max': 84})
+                    lo, hi = ranges['min'], ranges['max']
+                matching = [m for m in range(lo, hi + 1) if m % 12 == pc]
+                non_matching = [m for m in range(lo, hi + 1) if m % 12 != pc]
+
+                has_pc = self.model.NewBoolVar(
+                    f'has_pc{pc}_{name}_t{step_index}')
+                if matching:
+                    self.model.AddAllowedAssignments(
+                        [var], [[v] for v in matching]).OnlyEnforceIf(has_pc)
+                else:
+                    # Voice can never cover this PC — force indicator false
+                    self.model.Add(has_pc == 0)
+                if non_matching:
+                    self.model.AddAllowedAssignments(
+                        [var], [[v] for v in non_matching]).OnlyEnforceIf(has_pc.Not())
+                else:
+                    # Voice must cover this PC (only matching values exist)
+                    self.model.Add(has_pc == 1)
+                indicators.append(has_pc)
+
+            # At least one voice must cover this pitch class
+            self.model.AddBoolOr(indicators)
+
+    def add_bass_restriction_constraint(self, step_index, root_note, chord_type,
+                                        bass_voice=None):
+        """
+        Hard constraint: the bass voice may only play certain chord tones
+        (typically root or fifth), as defined in theory_definitions.json
+        under bass_restrictions.
+        """
+        if bass_voice is None:
+            bass_voice = self.voice_names[-1] if self.voice_names else None
+        if bass_voice is None or bass_voice not in self.voices:
+            return
+
+        restrictions = self.theory.get('bass_restrictions', {}).get(chord_type)
+        if not restrictions:
+            return
+
+        chord_intervals = (self.theory['chords'].get(chord_type)
+                           or self.theory['chords']['triads'].get(chord_type))
+        if not chord_intervals:
+            return
+
+        allowed_pcs = set((root_note + iv) % 12 for iv in restrictions)
+
+        ranges = self.theory['voice_ranges_midi'].get(
+            bass_voice, {'min': 36, 'max': 62})
+        lo, hi = ranges['min'], ranges['max']
+        allowed = [m for m in range(lo, hi + 1) if m % 12 in allowed_pcs]
+        if allowed:
+            self.model.AddAllowedAssignments(
+                [self.voices[bass_voice][step_index]],
+                [[v] for v in allowed])
+
+    def add_parallel_octave_penalty(self, weight=1):
+        """
+        Soft constraint penalising parallel octaves (or unisons) between
+        consecutive steps.  A parallel octave is when two voices are an octave
+        (or unison) apart at step t AND at step t+1, and at least one of
+        them moved.
+        """
+        num_voices = len(self.voice_names)
+        if self.steps < 2:
+            return
+
+        # Pre-compute per-voice "moved" BoolVars (shared across pairs)
+        moved = {}  # (voice_name, t) -> BoolVar
+        for name in self.voice_names:
+            for t in range(self.steps - 1):
+                m = self.model.NewBoolVar(f'moved_{name}_t{t}')
+                self.model.Add(
+                    self.voices[name][t] != self.voices[name][t + 1]
+                ).OnlyEnforceIf(m)
+                self.model.Add(
+                    self.voices[name][t] == self.voices[name][t + 1]
+                ).OnlyEnforceIf(m.Not())
+                moved[(name, t)] = m
+
+        # Octave multiples within MIDI range [24, 96] => max diff 72
+        octave_values = [v for v in range(0, 73) if v % 12 == 0]
+
+        for i in range(num_voices):
+            for j in range(i + 1, num_voices):
+                ni, nj = self.voice_names[i], self.voice_names[j]
+                for t in range(self.steps - 1):
+                    # --- is_octave at step t ---
+                    diff_t = self.model.NewIntVar(0, 72,
+                        f'pdiff_{ni}_{nj}_t{t}')
+                    self.model.AddAbsEquality(
+                        diff_t, self.voices[ni][t] - self.voices[nj][t])
+                    is_oct_t = self.model.NewBoolVar(
+                        f'isoct_{ni}_{nj}_t{t}')
+                    self.model.AddAllowedAssignments(
+                        [diff_t], [[v] for v in octave_values]
+                    ).OnlyEnforceIf(is_oct_t)
+                    non_octave = [v for v in range(0, 73) if v % 12 != 0]
+                    self.model.AddAllowedAssignments(
+                        [diff_t], [[v] for v in non_octave]
+                    ).OnlyEnforceIf(is_oct_t.Not())
+
+                    # --- is_octave at step t+1 ---
+                    diff_t1 = self.model.NewIntVar(0, 72,
+                        f'pdiff_{ni}_{nj}_t{t + 1}_from{t}')
+                    self.model.AddAbsEquality(
+                        diff_t1,
+                        self.voices[ni][t + 1] - self.voices[nj][t + 1])
+                    is_oct_t1 = self.model.NewBoolVar(
+                        f'isoct_{ni}_{nj}_t{t + 1}_from{t}')
+                    self.model.AddAllowedAssignments(
+                        [diff_t1], [[v] for v in octave_values]
+                    ).OnlyEnforceIf(is_oct_t1)
+                    self.model.AddAllowedAssignments(
+                        [diff_t1], [[v] for v in non_octave]
+                    ).OnlyEnforceIf(is_oct_t1.Not())
+
+                    # --- either voice moved ---
+                    either_moved = self.model.NewBoolVar(
+                        f'emoved_{ni}_{nj}_t{t}')
+                    self.model.AddBoolOr([moved[(ni, t)], moved[(nj, t)]]
+                                         ).OnlyEnforceIf(either_moved)
+                    self.model.AddBoolAnd([moved[(ni, t)].Not(),
+                                           moved[(nj, t)].Not()]
+                                          ).OnlyEnforceIf(either_moved.Not())
+
+                    # --- is_parallel_octave = oct_t AND oct_t1 AND either_moved ---
+                    is_par = self.model.NewBoolVar(
+                        f'par_oct_{ni}_{nj}_t{t}')
+                    self.model.AddBoolAnd([is_oct_t, is_oct_t1, either_moved]
+                                          ).OnlyEnforceIf(is_par)
+                    # Negation: at least one is false => not parallel
+                    self.model.AddBoolOr([is_oct_t.Not(), is_oct_t1.Not(),
+                                          either_moved.Not()]
+                                         ).OnlyEnforceIf(is_par.Not())
+
+                    for _ in range(weight):
+                        self._objective_terms.append(is_par.Not())
+
     def solve(self):
         """
         Runs the solver and returns a dictionary of results.
@@ -261,7 +500,9 @@ if __name__ == "__main__":
 
     # Structural constraints
     solver.add_no_crossing_constraint()
-    solver.add_voice_leading_constraint(max_interval=7, exclude_voices=['soprano'])
+    solver.add_voice_leading_constraint(max_interval=7,
+                                        per_voice_max={'alto': 4, 'tenor': 4},
+                                        exclude_voices=['soprano'])
 
     # Keep all notes diatonic to C major
     solver.add_scale_constraint(key_root=0, scale_type='major', exclude_voices=['soprano'])
@@ -270,16 +511,30 @@ if __name__ == "__main__":
     solver.add_harmonic_constraint(0, 0, 'major', exclude_voices=['soprano'])   # C major (I)
     solver.add_harmonic_constraint(1, 7, 'major', exclude_voices=['soprano'])   # G major (V)
 
+    # Chord completeness for explicit chords
+    solver.add_chord_completeness_constraint(0, 0, 'major', exclude_voices=['soprano'])
+    solver.add_chord_completeness_constraint(1, 7, 'major', exclude_voices=['soprano'])
+
+    # Bass restrictions for explicit chords
+    solver.add_bass_restriction_constraint(0, 0, 'major')
+    solver.add_bass_restriction_constraint(1, 7, 'major')
+
     # Plagal cadence at the end (steps 2-3): IV -> I
     solver.add_cadence_constraint(key_root=0, scale_type='major',
                                   cadence_type='plagal', start_step=2,
-                                  exclude_voices=['soprano'])
+                                  exclude_voices=['soprano'],
+                                  ensure_completeness=True, restrict_bass=True)
 
     # Prefer root in bass (use correct root per chord)
     solver.add_doubling_preference(0, 0)   # C for I
     solver.add_doubling_preference(1, 7)   # G for V
     solver.add_doubling_preference(2, 5)   # F for IV
     solver.add_doubling_preference(3, 0)   # C for I
+
+    # Voicing quality: soft constraints
+    solver.add_unison_penalty()
+    solver.add_spacing_constraint()
+    solver.add_parallel_octave_penalty()
 
     solution = solver.solve()
     if solution:
