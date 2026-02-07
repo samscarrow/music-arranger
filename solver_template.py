@@ -27,6 +27,15 @@ class ArrangerSolver:
         # Objective terms for soft constraints (list of BoolVars to maximize)
         self._objective_terms = []
 
+        # Diagnostic tracking
+        self._constraint_log = []       # list of dicts describing each applied constraint
+        self._domain_tracker = {}       # {voice_name: {step: set(midi_values)}}
+        self._melody_pins = {}          # {step_index: midi_pitch}
+        self._melody_voice = None
+        self._scale_info = None         # (key_root, scale_type, scale_pcs, exclude_voices)
+        self._diagnostics = []          # populated by validate()
+        self._failure_stats = None      # populated by solve() on failure
+
     def setup_problem(self, num_steps, voice_names=['soprano', 'alto', 'tenor', 'bass']):
         """
         Initializes the variables (MIDI pitch integers) for each voice at each time step.
@@ -36,13 +45,15 @@ class ArrangerSolver:
         
         for name in voice_names:
             self.voices[name] = []
+            self._domain_tracker[name] = {}
             # Get range from theory dict, default to wide range if missing
             ranges = self.theory['voice_ranges_midi'].get(name, {'min': 36, 'max': 84})
-            
+
             for t in range(num_steps):
                 # Create a variable for Note at Time t with domain [min, max]
                 var = self.model.NewIntVar(24, 96, f'{name}_t{t}')
                 self.voices[name].append(var)
+                self._domain_tracker[name][t] = set(range(24, 97))
 
         print(f"Problem Initialized: {len(voice_names)} voices, {num_steps} steps.")
 
@@ -65,6 +76,12 @@ class ArrangerSolver:
         # Note % 12 must equal (Root + Interval) % 12
         allowed_pcs = [(root_note + interval) % 12 for interval in chord_intervals]
 
+        self._constraint_log.append({
+            'type': 'harmonic', 'step': step_index,
+            'root': root_note, 'chord': chord_type,
+            'exclude_voices': list(exclude_voices),
+        })
+
         for name in self.voice_names:
             note_var = self.voices[name][step_index]
             # Pre-compute all MIDI values in the voice's range whose pitch class is allowed
@@ -76,6 +93,7 @@ class ArrangerSolver:
             allowed_values = [m for m in range(lo, hi + 1)
                               if m % 12 in allowed_pcs]
             self.model.AddAllowedAssignments([note_var], [[v] for v in allowed_values])
+            self._domain_tracker[name][step_index] &= set(allowed_values)
 
     def add_melodic_constraint(self, voice_name, step_index, midi_pitch):
         """
@@ -83,11 +101,19 @@ class ArrangerSolver:
         """
         if voice_name in self.voices:
             self.model.Add(self.voices[voice_name][step_index] == midi_pitch)
+            self._melody_pins[step_index] = midi_pitch
+            self._melody_voice = voice_name
+            self._domain_tracker[voice_name][step_index] &= {midi_pitch}
+            self._constraint_log.append({
+                'type': 'melodic', 'step': step_index,
+                'voice': voice_name, 'pitch': midi_pitch,
+            })
 
     def add_no_crossing_constraint(self):
         """
         Ensures voices stay in order (Soprano > Alto > Tenor > Bass).
         """
+        self._constraint_log.append({'type': 'no_crossing'})
         for t in range(self.steps):
             # Iterate through voices by index
             for i in range(len(self.voice_names) - 1):
@@ -106,6 +132,11 @@ class ArrangerSolver:
         """
         if exclude_voices is None:
             exclude_voices = []
+        self._constraint_log.append({
+            'type': 'voice_leading', 'max_interval': max_interval,
+            'per_voice_max': per_voice_max,
+            'exclude_voices': list(exclude_voices),
+        })
         for name in self.voice_names:
             if name in exclude_voices:
                 continue
@@ -146,6 +177,15 @@ class ArrangerSolver:
         bass_voice = self.voice_names[-1] if self.voice_names else None
 
         progression = cadence['progression']
+        self._constraint_log.append({
+            'type': 'cadence', 'cadence_type': cadence_type,
+            'start_step': start_step, 'progression_len': len(progression),
+            'available_steps': self.steps - start_step,
+            'melody_voice': melody_voice,
+            'exclude_voices': list(exclude_voices),
+            'ensure_completeness': ensure_completeness,
+            'restrict_bass': restrict_bass,
+        })
         for i, numeral in enumerate(progression):
             step = start_step + i
             if step >= self.steps:
@@ -191,6 +231,11 @@ class ArrangerSolver:
                     allowed = [m for m in range(lo, hi + 1)
                                if m % 12 == tonic_pc]
                     self.model.AddAllowedAssignments([mel_var], [[v] for v in allowed])
+                    self._domain_tracker[melody_voice][last_step] &= set(allowed)
+                    self._constraint_log.append({
+                        'type': 'soprano_on_root', 'step': last_step,
+                        'voice': melody_voice, 'tonic_pc': tonic_pc,
+                    })
 
     def add_scale_constraint(self, key_root, scale_type, exclude_voices=None):
         """
@@ -207,6 +252,11 @@ class ArrangerSolver:
             return
 
         scale_pcs = set((key_root + degree) % 12 for degree in scale_intervals)
+        self._scale_info = (key_root, scale_type, scale_pcs, list(exclude_voices))
+        self._constraint_log.append({
+            'type': 'scale', 'key_root': key_root, 'scale_type': scale_type,
+            'exclude_voices': list(exclude_voices),
+        })
 
         for name in self.voice_names:
             if name in exclude_voices:
@@ -216,9 +266,11 @@ class ArrangerSolver:
                 lo, hi = ranges['min'], ranges['max']
             allowed_values = [m for m in range(lo, hi + 1)
                               if m % 12 in scale_pcs]
+            allowed_set = set(allowed_values)
             for t in range(self.steps):
                 self.model.AddAllowedAssignments(
                     [self.voices[name][t]], [[v] for v in allowed_values])
+                self._domain_tracker[name][t] &= allowed_set
 
     def add_doubling_preference(self, step_index, root_pc, bass_voice=None):
         """
@@ -314,6 +366,11 @@ class ArrangerSolver:
         """
         if exclude_voices is None:
             exclude_voices = []
+        self._constraint_log.append({
+            'type': 'chord_completeness', 'step': step_index,
+            'root': root_note, 'chord': chord_type,
+            'exclude_voices': list(exclude_voices),
+        })
         chord_intervals = (self.theory['chords'].get(chord_type)
                            or self.theory['chords']['triads'].get(chord_type))
         if not chord_intervals:
@@ -380,10 +437,16 @@ class ArrangerSolver:
             bass_voice, {'min': 36, 'max': 62})
         lo, hi = ranges['min'], ranges['max']
         allowed = [m for m in range(lo, hi + 1) if m % 12 in allowed_pcs]
+        self._constraint_log.append({
+            'type': 'bass_restriction', 'step': step_index,
+            'root': root_note, 'chord': chord_type,
+            'bass_voice': bass_voice, 'allowed_pcs': list(allowed_pcs),
+        })
         if allowed:
             self.model.AddAllowedAssignments(
                 [self.voices[bass_voice][step_index]],
                 [[v] for v in allowed])
+            self._domain_tracker[bass_voice][step_index] &= set(allowed)
 
     def add_parallel_octave_penalty(self, weight=1):
         """
@@ -468,22 +531,165 @@ class ArrangerSolver:
                     for _ in range(weight):
                         self._objective_terms.append(is_par.Not())
 
+    def validate(self):
+        """
+        Pre-solve validation. Returns a list of (level, message) tuples
+        where level is 'ERROR', 'WARN', or 'INFO'.
+        """
+        results = []
+        NOTE_NAMES = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
+
+        def pitch_str(midi):
+            return f"{NOTE_NAMES[midi % 12]}{(midi // 12) - 1}"
+
+        # Check A: Empty domain intersection
+        for name in self.voice_names:
+            for t in range(self.steps):
+                domain = self._domain_tracker.get(name, {}).get(t, set())
+                if not domain:
+                    # Find which constraints touched this voice/step
+                    relevant = [c for c in self._constraint_log
+                                if c.get('step') == t or c['type'] in ('scale', 'no_crossing', 'voice_leading')]
+                    constraint_types = [c['type'] for c in relevant]
+                    results.append(('ERROR',
+                        f"Empty domain for {name} at step {t}. "
+                        f"Constraints applied: {', '.join(constraint_types)}"))
+
+        # Check B: Melody note outside scale
+        if self._scale_info and self._melody_voice:
+            key_root, scale_type, scale_pcs, scale_excludes = self._scale_info
+            if self._melody_voice not in scale_excludes:
+                for step, pitch in self._melody_pins.items():
+                    if pitch % 12 not in scale_pcs:
+                        results.append(('ERROR',
+                            f"Melody note {pitch_str(pitch)} (pc {pitch % 12}) "
+                            f"at step {step} not in {NOTE_NAMES[key_root]} {scale_type} "
+                            f"scale (pcs {sorted(scale_pcs)})"))
+
+        # Check C: soprano_on_root vs melody pin conflict
+        soprano_root_entries = [c for c in self._constraint_log
+                                if c['type'] == 'soprano_on_root']
+        for entry in soprano_root_entries:
+            step = entry['step']
+            tonic_pc = entry['tonic_pc']
+            if step in self._melody_pins:
+                pinned_pc = self._melody_pins[step] % 12
+                if pinned_pc != tonic_pc:
+                    results.append(('ERROR',
+                        f"Perfect authentic cadence requires {entry['voice']} on "
+                        f"tonic (pc {tonic_pc}/{NOTE_NAMES[tonic_pc]}) at step {step}, "
+                        f"but melody is pinned to {pitch_str(self._melody_pins[step])} "
+                        f"(pc {pinned_pc}/{NOTE_NAMES[pinned_pc]})"))
+
+        # Check D: Cadence truncation
+        cadence_entries = [c for c in self._constraint_log if c['type'] == 'cadence']
+        for entry in cadence_entries:
+            if entry['progression_len'] > entry['available_steps']:
+                results.append(('WARN',
+                    f"{entry['cadence_type']} cadence has {entry['progression_len']} "
+                    f"chords but only {entry['available_steps']} steps available "
+                    f"(starting at step {entry['start_step']}). "
+                    f"Cadence will be truncated."))
+
+        # Check E: Voice leading feasibility estimate
+        vl_entries = [c for c in self._constraint_log if c['type'] == 'voice_leading']
+        for vl in vl_entries:
+            per_voice = vl.get('per_voice_max') or {}
+            default_max = vl['max_interval']
+            excludes = vl.get('exclude_voices', [])
+            for name in self.voice_names:
+                if name in excludes:
+                    continue
+                limit = per_voice.get(name, default_max)
+                for t in range(self.steps - 1):
+                    domain_t = self._domain_tracker.get(name, {}).get(t, set())
+                    domain_t1 = self._domain_tracker.get(name, {}).get(t + 1, set())
+                    if not domain_t or not domain_t1:
+                        continue  # already caught by Check A
+                    min_jump = min(abs(a - b) for a in domain_t for b in domain_t1)
+                    if min_jump > limit:
+                        results.append(('WARN',
+                            f"{name} must jump at least {min_jump} semitones "
+                            f"between steps {t}-{t+1}, but limit is {limit}"))
+
+        # Check F: CP-SAT model validation
+        validation_msg = self.model.Validate()
+        if validation_msg:
+            results.append(('ERROR', f"CP-SAT model validation: {validation_msg}"))
+
+        return results
+
+    def get_diagnostic_report(self):
+        """
+        Formats a human-readable diagnostic report from validate() results,
+        solver failure stats, and the constraint log summary.
+        """
+        lines = []
+        lines.append("=" * 60)
+        lines.append("SOLVER DIAGNOSTIC REPORT")
+        lines.append("=" * 60)
+
+        # Diagnostics from validate()
+        if self._diagnostics:
+            lines.append("")
+            lines.append("Pre-solve checks:")
+            for level, msg in self._diagnostics:
+                lines.append(f"  [{level}] {msg}")
+        else:
+            lines.append("")
+            lines.append("Pre-solve checks: all passed")
+
+        # Failure stats from solver
+        if self._failure_stats:
+            lines.append("")
+            lines.append("Solver stats:")
+            lines.append(f"  Status: {self._failure_stats['status']}")
+            lines.append(f"  Wall time: {self._failure_stats['wall_time']:.3f}s")
+            lines.append(f"  Conflicts: {self._failure_stats['num_conflicts']}")
+            lines.append(f"  Branches: {self._failure_stats['num_branches']}")
+
+        # Constraint log summary
+        if self._constraint_log:
+            lines.append("")
+            lines.append("Constraints applied:")
+            type_counts = {}
+            for entry in self._constraint_log:
+                t = entry['type']
+                type_counts[t] = type_counts.get(t, 0) + 1
+            for ctype, count in type_counts.items():
+                lines.append(f"  {ctype}: {count}")
+
+        lines.append("=" * 60)
+        return "\n".join(lines)
+
     def solve(self):
         """
         Runs the solver and returns a dictionary of results.
         """
+        # Run pre-solve validation
+        self._diagnostics = self.validate()
+        for level, msg in self._diagnostics:
+            if level in ('ERROR', 'WARN'):
+                print(f"[{level}] {msg}")
+
         # Apply accumulated soft-constraint objective
         if self._objective_terms:
             self.model.Maximize(sum(self._objective_terms))
 
         status = self.solver.Solve(self.model)
-        
-        if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             result = {}
             for name in self.voice_names:
                 result[name] = [self.solver.Value(v) for v in self.voices[name]]
             return result
         else:
+            self._failure_stats = {
+                'status': self.solver.status_name(status),
+                'wall_time': self.solver.wall_time,
+                'num_conflicts': self.solver.num_conflicts,
+                'num_branches': self.solver.num_branches,
+            }
             return None
 
 if __name__ == "__main__":

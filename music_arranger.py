@@ -420,7 +420,9 @@ class MusicArranger:
         print("Solving...")
         solution = solver.solve()
         if not solution:
-            raise RuntimeError("No feasible arrangement found. Try relaxing constraints.")
+            report = solver.get_diagnostic_report()
+            print(report)
+            raise RuntimeError("No feasible arrangement found. See diagnostics above.")
 
         print("Solution found!")
         for voice, notes in solution.items():
