@@ -261,12 +261,194 @@ def test_resolution_preference():
     return True  # Soft constraints — always pass but report
 
 
+def test_tessitura_preference():
+    """Single-step C major chord with barbershop voices; verify notes land within tessitura."""
+    print("\n=== Test: Tessitura Preference ===")
+
+    solver = ArrangerSolver()
+    voices = ['tenor_barbershop', 'lead', 'baritone', 'bass_barbershop']
+    solver.setup_problem(1, voices)
+    solver.add_no_crossing_constraint()
+
+    # C major chord
+    solver.add_harmonic_constraint(0, 0, 'major')
+    solver.add_chord_completeness_constraint(0, 0, 'major')
+
+    # Strong tessitura preference
+    solver.add_tessitura_preference(weight=3)
+
+    solution = solver.solve()
+    if not solution:
+        print("  FAIL: No solution found")
+        return False
+
+    NOTE_NAMES = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
+    ranges = solver.theory['voice_ranges_midi']
+    all_ok = True
+    for v in voices:
+        midi = solution[v][0]
+        name = f"{NOTE_NAMES[midi % 12]}{(midi // 12) - 1}"
+        tess_min = ranges[v]['tessitura_min']
+        tess_max = ranges[v]['tessitura_max']
+        in_tess = tess_min <= midi <= tess_max
+        status = "PASS" if in_tess else "WARN"
+        print(f"  {status}: {v} = {name} ({midi}), tessitura [{tess_min}-{tess_max}]")
+        if not in_tess:
+            all_ok = False
+
+    return all_ok
+
+
+def test_graduated_spacing():
+    """Barbershop voices with cone limits; verify upper pairs respect tighter limits."""
+    print("\n=== Test: Graduated Spacing ===")
+
+    solver = ArrangerSolver()
+    voices = ['tenor_barbershop', 'lead', 'baritone', 'bass_barbershop']
+    solver.setup_problem(1, voices)
+    solver.add_no_crossing_constraint()
+
+    # C major chord
+    solver.add_harmonic_constraint(0, 0, 'major')
+    solver.add_chord_completeness_constraint(0, 0, 'major')
+
+    # Graduated limits: tighter at top
+    pairs = {
+        ('tenor_barbershop', 'lead'): 8,
+        ('lead', 'baritone'): 10,
+        ('baritone', 'bass_barbershop'): 12,
+    }
+    solver.add_spacing_constraint(max_gap_per_pair=pairs, penalize_lowest_pair=True, weight=3)
+
+    solution = solver.solve()
+    if not solution:
+        print("  FAIL: No solution found")
+        return False
+
+    NOTE_NAMES = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
+    all_ok = True
+    for (upper, lower), limit in pairs.items():
+        u_midi = solution[upper][0]
+        l_midi = solution[lower][0]
+        gap = u_midi - l_midi
+        u_name = f"{NOTE_NAMES[u_midi % 12]}{(u_midi // 12) - 1}"
+        l_name = f"{NOTE_NAMES[l_midi % 12]}{(l_midi // 12) - 1}"
+        ok = gap <= limit
+        status = "PASS" if ok else "WARN"
+        print(f"  {status}: {upper}({u_name}) - {lower}({l_name}) = {gap} semitones (limit {limit})")
+        if not ok:
+            all_ok = False
+
+    return all_ok
+
+
+def test_common_tone_retention():
+    """C major -> A minor (share C=0 and E=4 PCs); verify at least one voice holds a common tone."""
+    print("\n=== Test: Common Tone Retention ===")
+
+    solver = ArrangerSolver()
+    solver.setup_problem(2, ['soprano', 'alto', 'tenor', 'bass'])
+    solver.add_no_crossing_constraint()
+
+    # C major at step 0, A minor at step 1
+    solver.add_harmonic_constraint(0, 0, 'major')
+    solver.add_harmonic_constraint(1, 9, 'minor')
+    solver.add_chord_completeness_constraint(0, 0, 'major')
+    solver.add_chord_completeness_constraint(1, 9, 'minor')
+    solver.add_voice_leading_constraint(max_interval=7)
+
+    # Strong common tone retention
+    chord_steps = [(0, 0, 'major'), (1, 9, 'minor')]
+    solver.add_common_tone_retention(chord_steps, weight=5)
+
+    solution = solver.solve()
+    if not solution:
+        print("  FAIL: No solution found")
+        return False
+
+    NOTE_NAMES = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
+    # Common PCs between C major (0,4,7) and A minor (9,0,4): C=0 and E=4
+    common_held = False
+    for v in ['soprano', 'alto', 'tenor', 'bass']:
+        n0 = solution[v][0]
+        n1 = solution[v][1]
+        name0 = f"{NOTE_NAMES[n0 % 12]}{(n0 // 12) - 1}"
+        name1 = f"{NOTE_NAMES[n1 % 12]}{(n1 // 12) - 1}"
+        held = (n0 == n1)
+        pc = n0 % 12
+        if held and pc in (0, 4):  # C or E
+            print(f"  PASS: {v} holds common tone {name0} ({n0})")
+            common_held = True
+        else:
+            print(f"  INFO: {v}: {name0} -> {name1}")
+
+    if common_held:
+        print("  PASS: At least one common tone held")
+    else:
+        print("  WARN: No common tone held (soft constraint)")
+
+    return True  # soft constraint — always pass but report
+
+
+def test_stepwise_inner_voice():
+    """3-step I-V-I with strong stepwise weight; verify inner voice motion <= 2 semitones."""
+    print("\n=== Test: Stepwise Inner Voice Motion ===")
+
+    solver = ArrangerSolver()
+    solver.setup_problem(3, ['soprano', 'alto', 'tenor', 'bass'])
+    solver.add_no_crossing_constraint()
+
+    # I - V - I in C major
+    solver.add_harmonic_constraint(0, 0, 'major')
+    solver.add_harmonic_constraint(1, 7, 'major')
+    solver.add_harmonic_constraint(2, 0, 'major')
+    solver.add_chord_completeness_constraint(0, 0, 'major')
+    solver.add_chord_completeness_constraint(1, 7, 'major')
+    solver.add_chord_completeness_constraint(2, 0, 'major')
+    solver.add_voice_leading_constraint(max_interval=7)
+
+    # Strong stepwise preference for inner voices
+    solver.add_stepwise_motion_preference(weight=5)
+
+    solution = solver.solve()
+    if not solution:
+        print("  FAIL: No solution found")
+        return False
+
+    NOTE_NAMES = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
+    inner_voices = ['alto', 'tenor']
+    all_stepwise = True
+    for v in inner_voices:
+        for t in range(2):
+            n0 = solution[v][t]
+            n1 = solution[v][t + 1]
+            motion = abs(n1 - n0)
+            name0 = f"{NOTE_NAMES[n0 % 12]}{(n0 // 12) - 1}"
+            name1 = f"{NOTE_NAMES[n1 % 12]}{(n1 // 12) - 1}"
+            ok = motion <= 2
+            status = "PASS" if ok else "WARN"
+            print(f"  {status}: {v} step {t}->{t+1}: {name0}->{name1} (motion={motion})")
+            if not ok:
+                all_stepwise = False
+
+    if all_stepwise:
+        print("  PASS: All inner voice motion is stepwise")
+    else:
+        print("  WARN: Some inner voice motion exceeds 2 semitones (soft constraint)")
+
+    return True  # soft constraint — always pass but report
+
+
 if __name__ == "__main__":
     results = []
     results.append(("Seventh chord lookup", test_seventh_chord_lookup()))
     results.append(("Soft scale allows chromatic", test_soft_scale_allows_chromatic()))
     results.append(("Barbershop tag", test_barbershop_tag()))
     results.append(("Resolution preference", test_resolution_preference()))
+    results.append(("Tessitura preference", test_tessitura_preference()))
+    results.append(("Graduated spacing", test_graduated_spacing()))
+    results.append(("Common tone retention", test_common_tone_retention()))
+    results.append(("Stepwise inner voice", test_stepwise_inner_voice()))
 
     print("\n=== Summary ===")
     for name, passed in results:

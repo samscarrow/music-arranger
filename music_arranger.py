@@ -444,6 +444,7 @@ class MusicArranger:
         chord_sequence = constraints.get('chord_sequence', [])
         # Build step->index map for resolution lookahead
         step_to_idx = {cs['step']: i for i, cs in enumerate(chord_sequence)}
+        resolved_chords = []  # collect (step, root_pc, quality) for common tone retention
 
         for idx, chord_spec in enumerate(chord_sequence):
             step = chord_spec['step']
@@ -466,6 +467,7 @@ class MusicArranger:
             else:
                 continue  # no chord info at this step
 
+            resolved_chords.append((step, absolute_root, quality))
             solver.add_harmonic_constraint(step, absolute_root, quality,
                                            exclude_voices=[melody_voice])
             if enable_comp:
@@ -493,10 +495,30 @@ class MusicArranger:
 
         # 9. Voicing quality: soft constraints
         solver.add_unison_penalty()
-        solver.add_spacing_constraint()
+
+        # Graduated spacing for barbershop voices; uniform for others
+        barbershop_voices = ('tenor_barbershop', 'lead', 'baritone', 'bass_barbershop')
+        if any(v in voice_names for v in barbershop_voices):
+            pairs = {}
+            for i in range(len(voice_names) - 1):
+                pairs[(voice_names[i], voice_names[i + 1])] = 12 - i * 2
+            solver.add_spacing_constraint(max_gap_per_pair=pairs)
+        else:
+            solver.add_spacing_constraint()
+
         solver.add_parallel_octave_penalty()
         solver.add_contrary_motion_preference(
             melody_voice=melody_voice, bass_voice=voice_names[-1])
+
+        # Tessitura preference
+        solver.add_tessitura_preference()
+
+        # Stepwise inner voice motion
+        solver.add_stepwise_motion_preference()
+
+        # Common tone retention
+        if resolved_chords:
+            solver.add_common_tone_retention(resolved_chords)
 
         # 10. Solve
         print("Solving...")
