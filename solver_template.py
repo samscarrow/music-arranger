@@ -38,10 +38,15 @@ class ArrangerSolver:
         self._moved_vars = {}           # cached per-voice "moved" BoolVars
 
     def _lookup_chord(self, chord_type):
-        """Look up chord intervals by type, searching triads then sevenths."""
+        """Look up chord intervals by type, searching triads then sevenths.
+
+        Returns intervals sorted ascending so positional indexing
+        (e.g. [1] = 3rd, [3] = 7th) is reliable regardless of JSON order.
+        """
         chords = self.theory['chords']
-        return (chords.get('triads', {}).get(chord_type)
-                or chords.get('sevenths', {}).get(chord_type))
+        intervals = (chords.get('triads', {}).get(chord_type)
+                     or chords.get('sevenths', {}).get(chord_type))
+        return sorted(intervals) if intervals else None
 
     def setup_problem(self, num_steps, voice_names=['soprano', 'alto', 'tenor', 'bass']):
         """
@@ -355,15 +360,23 @@ class ArrangerSolver:
                         self._objective_terms.append(is_unison.Not())
 
     def add_spacing_constraint(self, max_total_spread=19, max_adjacent_upper=12,
-                               weight=1):
+                               weight=1, max_gap_per_pair=None,
+                               penalize_lowest_pair=False):
         """
         Soft constraint penalising wide voicings.
 
         - Total spread: penalise when highest – lowest voice > max_total_spread
-        - Adjacent upper voices: for each adjacent pair except the lowest, penalise
-          when the gap > max_adjacent_upper
+        - Adjacent voices: penalise when the gap exceeds the limit.
+        - max_gap_per_pair: optional dict mapping (upper_voice, lower_voice) tuple
+          to max semitones, overriding max_adjacent_upper for that pair.
+        - penalize_lowest_pair: if True, apply gap penalty to the lowest adjacent
+          pair too (normally skipped).
         Relies on the no-crossing constraint ensuring voices[i] >= voices[i+1].
         """
+        if max_gap_per_pair is None:
+            max_gap_per_pair = {}
+
+        last_pair_idx = len(self.voice_names) - 2
         for t in range(self.steps):
             top = self.voices[self.voice_names[0]][t]
             bot = self.voices[self.voice_names[-1]][t]
@@ -375,17 +388,24 @@ class ArrangerSolver:
             for _ in range(weight):
                 self._objective_terms.append(is_wide.Not())
 
-            # Adjacent upper voices (all pairs except the lowest pair)
-            for i in range(len(self.voice_names) - 2):
-                upper = self.voices[self.voice_names[i]][t]
-                lower = self.voices[self.voice_names[i + 1]][t]
+            # Adjacent voice pairs
+            for i in range(len(self.voice_names) - 1):
+                # Skip lowest pair unless penalize_lowest_pair is set
+                if i == last_pair_idx and not penalize_lowest_pair:
+                    continue
+                upper_name = self.voice_names[i]
+                lower_name = self.voice_names[i + 1]
+                upper = self.voices[upper_name][t]
+                lower = self.voices[lower_name][t]
+                # Per-pair limit or fallback
+                limit = max_gap_per_pair.get((upper_name, lower_name), max_adjacent_upper)
                 gap = self.model.NewIntVar(0, 72,
-                    f'adj_gap_{self.voice_names[i]}_{self.voice_names[i+1]}_t{t}')
+                    f'adj_gap_{upper_name}_{lower_name}_t{t}')
                 self.model.Add(gap == upper - lower)
                 is_far = self.model.NewBoolVar(
-                    f'adj_far_{self.voice_names[i]}_{self.voice_names[i+1]}_t{t}')
-                self.model.Add(gap > max_adjacent_upper).OnlyEnforceIf(is_far)
-                self.model.Add(gap <= max_adjacent_upper).OnlyEnforceIf(is_far.Not())
+                    f'adj_far_{upper_name}_{lower_name}_t{t}')
+                self.model.Add(gap > limit).OnlyEnforceIf(is_far)
+                self.model.Add(gap <= limit).OnlyEnforceIf(is_far.Not())
                 for _ in range(weight):
                     self._objective_terms.append(is_far.Not())
 
@@ -687,6 +707,124 @@ class ArrangerSolver:
             ).OnlyEnforceIf(m.Not())
             self._moved_vars[key] = m
         return self._moved_vars[key]
+
+    def add_common_tone_retention(self, chord_steps, weight=2):
+        """
+        Soft constraint rewarding voices that hold a common tone at the same
+        MIDI pitch across consecutive chord changes.
+
+        chord_steps: list of (step_index, root_pc, chord_type) sorted by step.
+        """
+        if len(chord_steps) < 2:
+            return
+
+        for ci in range(len(chord_steps) - 1):
+            step_t, root_t, quality_t = chord_steps[ci]
+            step_t1, root_t1, quality_t1 = chord_steps[ci + 1]
+
+            intervals_t = self._lookup_chord(quality_t)
+            intervals_t1 = self._lookup_chord(quality_t1)
+            if not intervals_t or not intervals_t1:
+                continue
+
+            pcs_t = set((root_t + iv) % 12 for iv in intervals_t)
+            pcs_t1 = set((root_t1 + iv) % 12 for iv in intervals_t1)
+            common_pcs = pcs_t & pcs_t1
+            if not common_pcs:
+                continue
+
+            for pc in common_pcs:
+                for name in self.voice_names:
+                    var_t = self.voices[name][step_t]
+                    var_t1 = self.voices[name][step_t1]
+
+                    # has_pc: voice has this PC at step t
+                    matching = [m for m in range(24, 97) if m % 12 == pc]
+                    non_matching = [m for m in range(24, 97) if m % 12 != pc]
+                    has_pc = self.model.NewBoolVar(
+                        f'ct_haspc{pc}_{name}_s{step_t}')
+                    self.model.AddAllowedAssignments(
+                        [var_t], [[v] for v in matching]
+                    ).OnlyEnforceIf(has_pc)
+                    self.model.AddAllowedAssignments(
+                        [var_t], [[v] for v in non_matching]
+                    ).OnlyEnforceIf(has_pc.Not())
+
+                    # stays: note unchanged between step t and t+1
+                    stays = self.model.NewBoolVar(
+                        f'ct_stays_{name}_s{step_t}_{step_t1}_pc{pc}')
+                    self.model.Add(var_t == var_t1).OnlyEnforceIf(stays)
+                    self.model.Add(var_t != var_t1).OnlyEnforceIf(stays.Not())
+
+                    # held: has_pc AND stays
+                    held = self.model.NewBoolVar(
+                        f'ct_held_{name}_s{step_t}_{step_t1}_pc{pc}')
+                    self.model.AddBoolAnd([has_pc, stays]).OnlyEnforceIf(held)
+                    self.model.AddBoolOr(
+                        [has_pc.Not(), stays.Not()]
+                    ).OnlyEnforceIf(held.Not())
+
+                    for _ in range(weight):
+                        self._objective_terms.append(held)
+
+    def add_tessitura_preference(self, weight=1):
+        """
+        Soft constraint rewarding notes within the voice's tessitura sub-range.
+        Voices without tessitura_min/tessitura_max in theory data are skipped.
+        """
+        for name in self.voice_names:
+            ranges = self.theory['voice_ranges_midi'].get(name, {})
+            tess_min = ranges.get('tessitura_min')
+            tess_max = ranges.get('tessitura_max')
+            if tess_min is None or tess_max is None:
+                continue
+            tessitura_values = list(range(tess_min, tess_max + 1))
+            for t in range(self.steps):
+                var = self.voices[name][t]
+                in_tess = self.model.NewBoolVar(f'tess_{name}_t{t}')
+                self.model.AddAllowedAssignments(
+                    [var], [[v] for v in tessitura_values]
+                ).OnlyEnforceIf(in_tess)
+                outside = [m for m in range(24, 97) if m < tess_min or m > tess_max]
+                self.model.AddAllowedAssignments(
+                    [var], [[v] for v in outside]
+                ).OnlyEnforceIf(in_tess.Not())
+                for _ in range(weight):
+                    self._objective_terms.append(in_tess)
+
+    def add_stepwise_motion_preference(self, inner_voices=None, max_stepwise=2, weight=1):
+        """
+        Soft constraint rewarding stepwise motion (0, 1, or 2 semitones) in
+        inner voices. If inner_voices is None, auto-detects as all voices
+        except the first and last.
+        """
+        if self.steps < 2:
+            return
+        if inner_voices is None:
+            if len(self.voice_names) <= 2:
+                return
+            inner_voices = self.voice_names[1:-1]
+
+        stepwise_values = list(range(0, max_stepwise + 1))
+        non_stepwise = list(range(max_stepwise + 1, 73))
+
+        for name in inner_voices:
+            if name not in self.voices:
+                continue
+            for t in range(self.steps - 1):
+                var_t = self.voices[name][t]
+                var_t1 = self.voices[name][t + 1]
+                abs_motion = self.model.NewIntVar(0, 72, f'sw_abs_{name}_t{t}')
+                self.model.AddAbsEquality(abs_motion, var_t1 - var_t)
+                is_stepwise = self.model.NewBoolVar(f'sw_ok_{name}_t{t}')
+                self.model.AddAllowedAssignments(
+                    [abs_motion], [[v] for v in stepwise_values]
+                ).OnlyEnforceIf(is_stepwise)
+                self.model.AddAllowedAssignments(
+                    [abs_motion], [[v] for v in non_stepwise]
+                ).OnlyEnforceIf(is_stepwise.Not())
+                for _ in range(weight):
+                    self._objective_terms.append(is_stepwise)
 
     def add_contrary_motion_preference(self, melody_voice=None, bass_voice=None, weight=1):
         """
