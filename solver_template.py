@@ -32,7 +32,7 @@ class ArrangerSolver:
         self._domain_tracker = {}       # {voice_name: {step: set(midi_values)}}
         self._melody_pins = {}          # {step_index: midi_pitch}
         self._melody_voice = None
-        self._scale_info = None         # (key_root, scale_type, scale_pcs, exclude_voices)
+        self._scale_segments = []       # list of (key_root, scale_type, scale_pcs, exclude_voices, hard, start_step, end_step)
         self._diagnostics = []          # populated by validate()
         self._failure_stats = None      # populated by solve() on failure
         self._moved_vars = {}           # cached per-voice "moved" BoolVars
@@ -106,6 +106,113 @@ class ArrangerSolver:
                               if m % 12 in allowed_pcs]
             self.model.AddAllowedAssignments([note_var], [[v] for v in allowed_values])
             self._domain_tracker[name][step_index] &= set(allowed_values)
+
+    def add_nct_harmonic_constraint(self, step_index, root_note, chord_type,
+                                     key_root, scale_type,
+                                     exclude_voices=None,
+                                     max_ncts_per_step=1,
+                                     nct_penalty_weight=0,
+                                     boundary_step=False):
+        """
+        Harmonic constraint that allows non-chord tones (passing/neighbor notes).
+
+        Replaces add_harmonic_constraint at steps where NCTs are desired.
+        Non-excluded voices may play either a chord tone (CT) or a diatonic
+        non-chord tone (NCT). NCT voices must move stepwise (<=2 semitones)
+        into and out of the NCT.
+
+        boundary_step: if True, forces all chord tones (no NCTs allowed).
+        max_ncts_per_step: cap on how many voices can be NCTs simultaneously.
+        nct_penalty_weight: if >0, add soft preference for chord tones.
+        """
+        if exclude_voices is None:
+            exclude_voices = []
+
+        chord_intervals = self._lookup_chord(chord_type)
+        if not chord_intervals:
+            print(f"Warning: Chord type '{chord_type}' not found (NCT).")
+            return
+
+        chord_pcs = set((root_note + iv) % 12 for iv in chord_intervals)
+        scale_intervals = self.theory['scales'].get(scale_type)
+        if not scale_intervals:
+            print(f"Warning: Scale type '{scale_type}' not found (NCT).")
+            return
+        scale_pcs = set((key_root + deg) % 12 for deg in scale_intervals)
+        nct_pcs = scale_pcs - chord_pcs
+
+        self._constraint_log.append({
+            'type': 'nct_harmonic', 'step': step_index,
+            'root': root_note, 'chord': chord_type,
+            'boundary': boundary_step,
+            'max_ncts': max_ncts_per_step,
+            'exclude_voices': list(exclude_voices),
+        })
+
+        nct_indicators = []  # collect is_ct.Not() BoolVars to cap NCTs
+
+        for name in self.voice_names:
+            if name in exclude_voices:
+                continue
+            note_var = self.voices[name][step_index]
+
+            if name in exclude_voices:
+                lo, hi = 24, 96
+            else:
+                ranges = self.theory['voice_ranges_midi'].get(
+                    name, {'min': 36, 'max': 84})
+                lo, hi = ranges['min'], ranges['max']
+
+            ct_values = [m for m in range(lo, hi + 1) if m % 12 in chord_pcs]
+            nct_values = [m for m in range(lo, hi + 1) if m % 12 in nct_pcs]
+
+            # Boundary steps or no NCT values: chord tones only
+            if boundary_step or not nct_values:
+                self.model.AddAllowedAssignments(
+                    [note_var], [[v] for v in ct_values])
+                self._domain_tracker[name][step_index] &= set(ct_values)
+                continue
+
+            # Create CT/NCT switch
+            is_ct = self.model.NewBoolVar(
+                f'nct_isct_{name}_t{step_index}')
+            self.model.AddAllowedAssignments(
+                [note_var], [[v] for v in ct_values]
+            ).OnlyEnforceIf(is_ct)
+            self.model.AddAllowedAssignments(
+                [note_var], [[v] for v in nct_values]
+            ).OnlyEnforceIf(is_ct.Not())
+
+            self._domain_tracker[name][step_index] &= set(ct_values) | set(nct_values)
+            nct_indicators.append(is_ct.Not())
+
+            # Stepwise approach: |note[t] - note[t-1]| <= 2 when NCT
+            if step_index > 0:
+                prev_var = self.voices[name][step_index - 1]
+                approach_dist = self.model.NewIntVar(
+                    0, 72, f'nct_appr_{name}_t{step_index}')
+                self.model.AddAbsEquality(
+                    approach_dist, note_var - prev_var)
+                self.model.Add(approach_dist <= 2).OnlyEnforceIf(is_ct.Not())
+
+            # Stepwise departure: |note[t+1] - note[t]| <= 2 when NCT
+            if step_index < self.steps - 1:
+                next_var = self.voices[name][step_index + 1]
+                depart_dist = self.model.NewIntVar(
+                    0, 72, f'nct_dept_{name}_t{step_index}')
+                self.model.AddAbsEquality(
+                    depart_dist, next_var - note_var)
+                self.model.Add(depart_dist <= 2).OnlyEnforceIf(is_ct.Not())
+
+            # Optional soft preference for chord tones
+            if nct_penalty_weight > 0:
+                for _ in range(nct_penalty_weight):
+                    self._objective_terms.append(is_ct)
+
+        # Cap NCTs per step
+        if nct_indicators and max_ncts_per_step < len(nct_indicators):
+            self.model.Add(
+                sum(nct_indicators) <= max_ncts_per_step)
 
     def add_melodic_constraint(self, voice_name, step_index, midi_pitch):
         """
@@ -250,13 +357,18 @@ class ArrangerSolver:
                     })
 
     def add_scale_constraint(self, key_root, scale_type, exclude_voices=None,
-                             hard=True, diatonic_weight=2):
+                             hard=True, diatonic_weight=2,
+                             start_step=None, end_step=None):
         """
-        Constrains all notes across all steps to belong to a specific scale.
+        Constrains notes to belong to a specific scale over a step range.
 
         hard=True (default): AddAllowedAssignments forces diatonic pitches only.
         hard=False: soft preference — chromatic notes allowed but diatonic rewarded.
             diatonic_weight controls the objective bonus per diatonic note.
+
+        start_step/end_step define the half-open range [start, end). Defaults
+        to the full problem (0, self.steps). Call multiple times with different
+        ranges to support modulation.
 
         Voices in exclude_voices use a wide MIDI range (24-96) instead of the
         strict voice range, preventing infeasibility when a melody note is pinned
@@ -264,16 +376,23 @@ class ArrangerSolver:
         """
         if exclude_voices is None:
             exclude_voices = []
+        if start_step is None:
+            start_step = 0
+        if end_step is None:
+            end_step = self.steps
         scale_intervals = self.theory['scales'].get(scale_type)
         if not scale_intervals:
             print(f"Warning: Scale type '{scale_type}' not found.")
             return
 
         scale_pcs = set((key_root + degree) % 12 for degree in scale_intervals)
-        self._scale_info = (key_root, scale_type, scale_pcs, list(exclude_voices), hard)
+        self._scale_segments.append(
+            (key_root, scale_type, scale_pcs, list(exclude_voices), hard,
+             start_step, end_step))
         self._constraint_log.append({
             'type': 'scale', 'key_root': key_root, 'scale_type': scale_type,
             'exclude_voices': list(exclude_voices), 'hard': hard,
+            'start_step': start_step, 'end_step': end_step,
         })
 
         for name in self.voice_names:
@@ -287,16 +406,17 @@ class ArrangerSolver:
             diatonic_set = set(diatonic_values)
 
             if hard:
-                for t in range(self.steps):
+                for t in range(start_step, end_step):
                     self.model.AddAllowedAssignments(
                         [self.voices[name][t]], [[v] for v in diatonic_values])
                     self._domain_tracker[name][t] &= diatonic_set
             else:
                 # Soft mode: reward diatonic, allow chromatic
                 chromatic_values = [m for m in range(lo, hi + 1) if m % 12 not in scale_pcs]
-                for t in range(self.steps):
+                for t in range(start_step, end_step):
                     var = self.voices[name][t]
-                    is_diatonic = self.model.NewBoolVar(f'diatonic_{name}_t{t}')
+                    is_diatonic = self.model.NewBoolVar(
+                        f'diatonic_{name}_t{t}_k{key_root}')
                     self.model.AddAllowedAssignments(
                         [var], [[v] for v in diatonic_values]
                     ).OnlyEnforceIf(is_diatonic)
@@ -885,6 +1005,71 @@ class ArrangerSolver:
             for _ in range(weight):
                 self._objective_terms.append(is_contrary)
 
+    def add_specific_bass_constraint(self, step_index, pitch_class, bass_voice=None):
+        """
+        Hard constraint: Forces the bass voice to a specific pitch class.
+        Overrides general bass restrictions (like root/fifth only) if they conflict,
+        though usually used in conjunction with a chord that contains this PC.
+        """
+        if bass_voice is None:
+            bass_voice = self.voice_names[-1] if self.voice_names else None
+        if bass_voice is None or bass_voice not in self.voices:
+            return
+
+        self._constraint_log.append({
+            'type': 'specific_bass', 'step': step_index,
+            'pitch_class': pitch_class, 'bass_voice': bass_voice
+        })
+
+        bass_var = self.voices[bass_voice][step_index]
+        ranges = self.theory['voice_ranges_midi'].get(bass_voice, {'min': 36, 'max': 62})
+        lo, hi = ranges['min'], ranges['max']
+        
+        allowed_values = [m for m in range(lo, hi + 1) if m % 12 == pitch_class]
+        
+        if allowed_values:
+            self.model.AddAllowedAssignments([bass_var], [[v] for v in allowed_values])
+            self._domain_tracker[bass_voice][step_index] &= set(allowed_values)
+        else:
+            print(f"Warning: Specific bass PC {pitch_class} has no valid notes in range {lo}-{hi} for {bass_voice}")
+            # Ensure failure if impossible
+            self.model.Add(bass_var == -1) 
+
+    def add_rhythmic_stagger_preference(self, melody_voice, inner_voices, weight=1):
+        """
+        Soft constraint: When the melody holds a note (static from t to t+1),
+        reward at least one inner voice for moving. Creates a more active texture.
+        """
+        if self.steps < 2:
+            return
+        if melody_voice not in self.voices:
+            return
+        
+        valid_inner = [v for v in inner_voices if v in self.voices]
+        if not valid_inner:
+            return
+
+        for t in range(self.steps - 1):
+            # 1. Check if melody is static
+            mel_moved = self._get_moved_boolvar(melody_voice, t)
+            mel_static = self.model.NewBoolVar(f'mel_static_t{t}')
+            self.model.Add(mel_moved == 0).OnlyEnforceIf(mel_static)
+            self.model.Add(mel_moved == 1).OnlyEnforceIf(mel_static.Not())
+
+            # 2. Check if ANY inner voice moved
+            inner_moves = [self._get_moved_boolvar(v, t) for v in valid_inner]
+            any_inner_moved = self.model.NewBoolVar(f'any_inner_moved_t{t}')
+            self.model.AddBoolOr(inner_moves).OnlyEnforceIf(any_inner_moved)
+            self.model.AddBoolAnd([m.Not() for m in inner_moves]).OnlyEnforceIf(any_inner_moved.Not())
+
+            # 3. Reward (Melody Static AND Inner Moved)
+            staggered = self.model.NewBoolVar(f'staggered_t{t}')
+            self.model.AddBoolAnd([mel_static, any_inner_moved]).OnlyEnforceIf(staggered)
+            self.model.AddBoolOr([mel_static.Not(), any_inner_moved.Not()]).OnlyEnforceIf(staggered.Not())
+
+            for _ in range(weight):
+                self._objective_terms.append(staggered)
+
     def validate(self):
         """
         Pre-solve validation. Returns a list of (level, message) tuples
@@ -909,17 +1094,20 @@ class ArrangerSolver:
                         f"Empty domain for {name} at step {t}. "
                         f"Constraints applied: {', '.join(constraint_types)}"))
 
-        # Check B: Melody note outside scale
-        if self._scale_info and self._melody_voice:
-            key_root, scale_type, scale_pcs, scale_excludes, scale_hard = self._scale_info
-            if self._melody_voice not in scale_excludes:
-                for step, pitch in self._melody_pins.items():
-                    if pitch % 12 not in scale_pcs:
-                        level = 'ERROR' if scale_hard else 'INFO'
-                        results.append((level,
-                            f"Melody note {pitch_str(pitch)} (pc {pitch % 12}) "
-                            f"at step {step} not in {NOTE_NAMES[key_root]} {scale_type} "
-                            f"scale (pcs {sorted(scale_pcs)})"))
+        # Check B: Melody note outside scale (iterate all segments)
+        if self._scale_segments and self._melody_voice:
+            for step, pitch in self._melody_pins.items():
+                # Find the segment covering this step
+                for seg in self._scale_segments:
+                    key_root, scale_type, scale_pcs, scale_excludes, scale_hard, s_start, s_end = seg
+                    if s_start <= step < s_end and self._melody_voice not in scale_excludes:
+                        if pitch % 12 not in scale_pcs:
+                            level = 'ERROR' if scale_hard else 'INFO'
+                            results.append((level,
+                                f"Melody note {pitch_str(pitch)} (pc {pitch % 12}) "
+                                f"at step {step} not in {NOTE_NAMES[key_root]} {scale_type} "
+                                f"scale (pcs {sorted(scale_pcs)})"))
+                        break  # first matching segment wins
 
         # Check C: soprano_on_root vs melody pin conflict
         soprano_root_entries = [c for c in self._constraint_log
