@@ -35,6 +35,13 @@ class ArrangerSolver:
         self._scale_info = None         # (key_root, scale_type, scale_pcs, exclude_voices)
         self._diagnostics = []          # populated by validate()
         self._failure_stats = None      # populated by solve() on failure
+        self._moved_vars = {}           # cached per-voice "moved" BoolVars
+
+    def _lookup_chord(self, chord_type):
+        """Look up chord intervals by type, searching triads then sevenths."""
+        chords = self.theory['chords']
+        return (chords.get('triads', {}).get(chord_type)
+                or chords.get('sevenths', {}).get(chord_type))
 
     def setup_problem(self, num_steps, voice_names=['soprano', 'alto', 'tenor', 'bass']):
         """
@@ -66,7 +73,7 @@ class ArrangerSolver:
         """
         if exclude_voices is None:
             exclude_voices = []
-        chord_intervals = self.theory['chords'].get(chord_type) or self.theory['chords']['triads'].get(chord_type)
+        chord_intervals = self._lookup_chord(chord_type)
         if not chord_intervals:
             print(f"Warning: Chord type '{chord_type}' not found.")
             return
@@ -237,9 +244,15 @@ class ArrangerSolver:
                         'voice': melody_voice, 'tonic_pc': tonic_pc,
                     })
 
-    def add_scale_constraint(self, key_root, scale_type, exclude_voices=None):
+    def add_scale_constraint(self, key_root, scale_type, exclude_voices=None,
+                             hard=True, diatonic_weight=2):
         """
         Constrains all notes across all steps to belong to a specific scale.
+
+        hard=True (default): AddAllowedAssignments forces diatonic pitches only.
+        hard=False: soft preference — chromatic notes allowed but diatonic rewarded.
+            diatonic_weight controls the objective bonus per diatonic note.
+
         Voices in exclude_voices use a wide MIDI range (24-96) instead of the
         strict voice range, preventing infeasibility when a melody note is pinned
         outside the voice's strict range.
@@ -252,10 +265,10 @@ class ArrangerSolver:
             return
 
         scale_pcs = set((key_root + degree) % 12 for degree in scale_intervals)
-        self._scale_info = (key_root, scale_type, scale_pcs, list(exclude_voices))
+        self._scale_info = (key_root, scale_type, scale_pcs, list(exclude_voices), hard)
         self._constraint_log.append({
             'type': 'scale', 'key_root': key_root, 'scale_type': scale_type,
-            'exclude_voices': list(exclude_voices),
+            'exclude_voices': list(exclude_voices), 'hard': hard,
         })
 
         for name in self.voice_names:
@@ -264,13 +277,34 @@ class ArrangerSolver:
             else:
                 ranges = self.theory['voice_ranges_midi'].get(name, {'min': 36, 'max': 84})
                 lo, hi = ranges['min'], ranges['max']
-            allowed_values = [m for m in range(lo, hi + 1)
-                              if m % 12 in scale_pcs]
-            allowed_set = set(allowed_values)
-            for t in range(self.steps):
-                self.model.AddAllowedAssignments(
-                    [self.voices[name][t]], [[v] for v in allowed_values])
-                self._domain_tracker[name][t] &= allowed_set
+
+            diatonic_values = [m for m in range(lo, hi + 1) if m % 12 in scale_pcs]
+            diatonic_set = set(diatonic_values)
+
+            if hard:
+                for t in range(self.steps):
+                    self.model.AddAllowedAssignments(
+                        [self.voices[name][t]], [[v] for v in diatonic_values])
+                    self._domain_tracker[name][t] &= diatonic_set
+            else:
+                # Soft mode: reward diatonic, allow chromatic
+                chromatic_values = [m for m in range(lo, hi + 1) if m % 12 not in scale_pcs]
+                for t in range(self.steps):
+                    var = self.voices[name][t]
+                    is_diatonic = self.model.NewBoolVar(f'diatonic_{name}_t{t}')
+                    self.model.AddAllowedAssignments(
+                        [var], [[v] for v in diatonic_values]
+                    ).OnlyEnforceIf(is_diatonic)
+                    if chromatic_values:
+                        self.model.AddAllowedAssignments(
+                            [var], [[v] for v in chromatic_values]
+                        ).OnlyEnforceIf(is_diatonic.Not())
+                    else:
+                        # All values in range are diatonic — force true
+                        self.model.Add(is_diatonic == 1)
+                    for _ in range(diatonic_weight):
+                        self._objective_terms.append(is_diatonic)
+                    # Don't narrow domain tracker — chromatic notes are allowed
 
     def add_doubling_preference(self, step_index, root_pc, bass_voice=None):
         """
@@ -371,8 +405,7 @@ class ArrangerSolver:
             'root': root_note, 'chord': chord_type,
             'exclude_voices': list(exclude_voices),
         })
-        chord_intervals = (self.theory['chords'].get(chord_type)
-                           or self.theory['chords']['triads'].get(chord_type))
+        chord_intervals = self._lookup_chord(chord_type)
         if not chord_intervals:
             print(f"Warning: Chord type '{chord_type}' not found (completeness).")
             return
@@ -426,8 +459,7 @@ class ArrangerSolver:
         if not restrictions:
             return
 
-        chord_intervals = (self.theory['chords'].get(chord_type)
-                           or self.theory['chords']['triads'].get(chord_type))
+        chord_intervals = self._lookup_chord(chord_type)
         if not chord_intervals:
             return
 
@@ -459,18 +491,7 @@ class ArrangerSolver:
         if self.steps < 2:
             return
 
-        # Pre-compute per-voice "moved" BoolVars (shared across pairs)
-        moved = {}  # (voice_name, t) -> BoolVar
-        for name in self.voice_names:
-            for t in range(self.steps - 1):
-                m = self.model.NewBoolVar(f'moved_{name}_t{t}')
-                self.model.Add(
-                    self.voices[name][t] != self.voices[name][t + 1]
-                ).OnlyEnforceIf(m)
-                self.model.Add(
-                    self.voices[name][t] == self.voices[name][t + 1]
-                ).OnlyEnforceIf(m.Not())
-                moved[(name, t)] = m
+        # Use shared moved BoolVars (cached via _get_moved_boolvar)
 
         # Octave multiples within MIDI range [24, 96] => max diff 72
         octave_values = [v for v in range(0, 73) if v % 12 == 0]
@@ -510,12 +531,12 @@ class ArrangerSolver:
                     ).OnlyEnforceIf(is_oct_t1.Not())
 
                     # --- either voice moved ---
+                    mi = self._get_moved_boolvar(ni, t)
+                    mj = self._get_moved_boolvar(nj, t)
                     either_moved = self.model.NewBoolVar(
                         f'emoved_{ni}_{nj}_t{t}')
-                    self.model.AddBoolOr([moved[(ni, t)], moved[(nj, t)]]
-                                         ).OnlyEnforceIf(either_moved)
-                    self.model.AddBoolAnd([moved[(ni, t)].Not(),
-                                           moved[(nj, t)].Not()]
+                    self.model.AddBoolOr([mi, mj]).OnlyEnforceIf(either_moved)
+                    self.model.AddBoolAnd([mi.Not(), mj.Not()]
                                           ).OnlyEnforceIf(either_moved.Not())
 
                     # --- is_parallel_octave = oct_t AND oct_t1 AND either_moved ---
@@ -530,6 +551,201 @@ class ArrangerSolver:
 
                     for _ in range(weight):
                         self._objective_terms.append(is_par.Not())
+
+    def add_resolution_constraint(self, step_index, root_note, chord_type,
+                                   next_step_index=None, hard=False, weight=2,
+                                   exclude_voices=None):
+        """
+        Tendency tone resolution: reward (or enforce) the 7th resolving down
+        by step and the 3rd (leading tone) resolving up by half step.
+
+        Works between step_index and next_step_index (defaults to step_index+1).
+        """
+        if exclude_voices is None:
+            exclude_voices = []
+        if next_step_index is None:
+            next_step_index = step_index + 1
+        if next_step_index >= self.steps:
+            return
+
+        chord_intervals = self._lookup_chord(chord_type)
+        if not chord_intervals or len(chord_intervals) < 3:
+            return
+
+        # Identify the 3rd and 7th intervals of the chord
+        third_interval = chord_intervals[1]  # 3rd is index 1 (e.g. 4 for major/dom7)
+        seventh_interval = chord_intervals[3] if len(chord_intervals) >= 4 else None
+
+        third_pc = (root_note + third_interval) % 12
+        seventh_pc = (root_note + seventh_interval) % 12 if seventh_interval is not None else None
+
+        self._constraint_log.append({
+            'type': 'resolution', 'step': step_index,
+            'root': root_note, 'chord': chord_type,
+            'next_step': next_step_index,
+            'exclude_voices': list(exclude_voices),
+        })
+
+        for name in self.voice_names:
+            if name in exclude_voices:
+                continue
+            note_var = self.voices[name][step_index]
+            next_var = self.voices[name][next_step_index]
+
+            if name in exclude_voices:
+                lo, hi = 24, 96
+            else:
+                ranges = self.theory['voice_ranges_midi'].get(name, {'min': 36, 'max': 84})
+                lo, hi = ranges['min'], ranges['max']
+
+            # --- 7th resolution: resolve down by 1 or 2 semitones ---
+            if seventh_pc is not None:
+                seventh_pitches = [m for m in range(lo, hi + 1) if m % 12 == seventh_pc]
+                non_seventh = [m for m in range(lo, hi + 1) if m % 12 != seventh_pc]
+
+                if seventh_pitches:
+                    has_seventh = self.model.NewBoolVar(f'has7th_{name}_t{step_index}')
+                    self.model.AddAllowedAssignments(
+                        [note_var], [[v] for v in seventh_pitches]
+                    ).OnlyEnforceIf(has_seventh)
+                    if non_seventh:
+                        self.model.AddAllowedAssignments(
+                            [note_var], [[v] for v in non_seventh]
+                        ).OnlyEnforceIf(has_seventh.Not())
+                    else:
+                        self.model.Add(has_seventh == 1)
+
+                    # diff = next - current; want diff in {-1, -2}
+                    diff7 = self.model.NewIntVar(-72, 72, f'res7diff_{name}_t{step_index}')
+                    self.model.Add(diff7 == next_var - note_var)
+                    resolves_down = self.model.NewBoolVar(f'res7ok_{name}_t{step_index}')
+                    self.model.AddAllowedAssignments(
+                        [diff7], [[-1], [-2]]
+                    ).OnlyEnforceIf(resolves_down)
+                    non_resolve = [v for v in range(-72, 73) if v not in (-1, -2)]
+                    self.model.AddAllowedAssignments(
+                        [diff7], [[v] for v in non_resolve]
+                    ).OnlyEnforceIf(resolves_down.Not())
+
+                    # Combine: reward when has_seventh AND resolves_down
+                    both7 = self.model.NewBoolVar(f'res7both_{name}_t{step_index}')
+                    self.model.AddBoolAnd([has_seventh, resolves_down]).OnlyEnforceIf(both7)
+                    self.model.AddBoolOr([has_seventh.Not(), resolves_down.Not()]).OnlyEnforceIf(both7.Not())
+
+                    if hard:
+                        # If has_seventh, must resolve down
+                        self.model.AddImplication(has_seventh, resolves_down)
+                    else:
+                        for _ in range(weight):
+                            self._objective_terms.append(both7)
+
+            # --- 3rd (leading tone) resolution: resolve up by 1 semitone ---
+            third_pitches = [m for m in range(lo, hi + 1) if m % 12 == third_pc]
+            non_third = [m for m in range(lo, hi + 1) if m % 12 != third_pc]
+
+            if third_pitches:
+                has_third = self.model.NewBoolVar(f'has3rd_{name}_t{step_index}')
+                self.model.AddAllowedAssignments(
+                    [note_var], [[v] for v in third_pitches]
+                ).OnlyEnforceIf(has_third)
+                if non_third:
+                    self.model.AddAllowedAssignments(
+                        [note_var], [[v] for v in non_third]
+                    ).OnlyEnforceIf(has_third.Not())
+                else:
+                    self.model.Add(has_third == 1)
+
+                diff3 = self.model.NewIntVar(-72, 72, f'res3diff_{name}_t{step_index}')
+                self.model.Add(diff3 == next_var - note_var)
+                resolves_up = self.model.NewBoolVar(f'res3ok_{name}_t{step_index}')
+                self.model.AddAllowedAssignments([diff3], [[1]]).OnlyEnforceIf(resolves_up)
+                non_up = [v for v in range(-72, 73) if v != 1]
+                self.model.AddAllowedAssignments(
+                    [diff3], [[v] for v in non_up]
+                ).OnlyEnforceIf(resolves_up.Not())
+
+                both3 = self.model.NewBoolVar(f'res3both_{name}_t{step_index}')
+                self.model.AddBoolAnd([has_third, resolves_up]).OnlyEnforceIf(both3)
+                self.model.AddBoolOr([has_third.Not(), resolves_up.Not()]).OnlyEnforceIf(both3.Not())
+
+                if hard:
+                    self.model.AddImplication(has_third, resolves_up)
+                else:
+                    for _ in range(weight):
+                        self._objective_terms.append(both3)
+
+    def _get_moved_boolvar(self, name, t):
+        """Lazy-create and cache a BoolVar indicating voice `name` moved between t and t+1."""
+        key = (name, t)
+        if key not in self._moved_vars:
+            m = self.model.NewBoolVar(f'moved_{name}_t{t}')
+            self.model.Add(
+                self.voices[name][t] != self.voices[name][t + 1]
+            ).OnlyEnforceIf(m)
+            self.model.Add(
+                self.voices[name][t] == self.voices[name][t + 1]
+            ).OnlyEnforceIf(m.Not())
+            self._moved_vars[key] = m
+        return self._moved_vars[key]
+
+    def add_contrary_motion_preference(self, melody_voice=None, bass_voice=None, weight=1):
+        """
+        Soft constraint rewarding contrary motion between melody and bass voices.
+        When one moves up and the other moves down, reward. Stationary = neutral.
+        """
+        if melody_voice is None:
+            melody_voice = self.voice_names[0]
+        if bass_voice is None:
+            bass_voice = self.voice_names[-1]
+        if melody_voice not in self.voices or bass_voice not in self.voices:
+            return
+        if self.steps < 2:
+            return
+
+        self._constraint_log.append({
+            'type': 'contrary_motion',
+            'melody_voice': melody_voice, 'bass_voice': bass_voice,
+        })
+
+        for t in range(self.steps - 1):
+            mel_curr = self.voices[melody_voice][t]
+            mel_next = self.voices[melody_voice][t + 1]
+            bass_curr = self.voices[bass_voice][t]
+            bass_next = self.voices[bass_voice][t + 1]
+
+            # Melody direction: up (mel_next > mel_curr)
+            mel_up = self.model.NewBoolVar(f'mel_up_t{t}')
+            self.model.Add(mel_next > mel_curr).OnlyEnforceIf(mel_up)
+            self.model.Add(mel_next <= mel_curr).OnlyEnforceIf(mel_up.Not())
+
+            mel_down = self.model.NewBoolVar(f'mel_down_t{t}')
+            self.model.Add(mel_next < mel_curr).OnlyEnforceIf(mel_down)
+            self.model.Add(mel_next >= mel_curr).OnlyEnforceIf(mel_down.Not())
+
+            # Bass direction
+            bass_up = self.model.NewBoolVar(f'bass_up_t{t}')
+            self.model.Add(bass_next > bass_curr).OnlyEnforceIf(bass_up)
+            self.model.Add(bass_next <= bass_curr).OnlyEnforceIf(bass_up.Not())
+
+            bass_down = self.model.NewBoolVar(f'bass_down_t{t}')
+            self.model.Add(bass_next < bass_curr).OnlyEnforceIf(bass_down)
+            self.model.Add(bass_next >= bass_curr).OnlyEnforceIf(bass_down.Not())
+
+            # Contrary: mel_up AND bass_down, or mel_down AND bass_up
+            contrary1 = self.model.NewBoolVar(f'contrary1_t{t}')
+            self.model.AddBoolAnd([mel_up, bass_down]).OnlyEnforceIf(contrary1)
+            self.model.AddBoolOr([mel_up.Not(), bass_down.Not()]).OnlyEnforceIf(contrary1.Not())
+
+            contrary2 = self.model.NewBoolVar(f'contrary2_t{t}')
+            self.model.AddBoolAnd([mel_down, bass_up]).OnlyEnforceIf(contrary2)
+            self.model.AddBoolOr([mel_down.Not(), bass_up.Not()]).OnlyEnforceIf(contrary2.Not())
+
+            is_contrary = self.model.NewBoolVar(f'contrary_t{t}')
+            self.model.AddBoolOr([contrary1, contrary2]).OnlyEnforceIf(is_contrary)
+            self.model.AddBoolAnd([contrary1.Not(), contrary2.Not()]).OnlyEnforceIf(is_contrary.Not())
+
+            for _ in range(weight):
+                self._objective_terms.append(is_contrary)
 
     def validate(self):
         """
@@ -557,11 +773,12 @@ class ArrangerSolver:
 
         # Check B: Melody note outside scale
         if self._scale_info and self._melody_voice:
-            key_root, scale_type, scale_pcs, scale_excludes = self._scale_info
+            key_root, scale_type, scale_pcs, scale_excludes, scale_hard = self._scale_info
             if self._melody_voice not in scale_excludes:
                 for step, pitch in self._melody_pins.items():
                     if pitch % 12 not in scale_pcs:
-                        results.append(('ERROR',
+                        level = 'ERROR' if scale_hard else 'INFO'
+                        results.append((level,
                             f"Melody note {pitch_str(pitch)} (pc {pitch % 12}) "
                             f"at step {step} not in {NOTE_NAMES[key_root]} {scale_type} "
                             f"scale (pcs {sorted(scale_pcs)})"))

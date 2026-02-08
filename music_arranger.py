@@ -56,11 +56,33 @@ EXTRACT_TOOL = {
                     "type": "object",
                     "properties": {
                         "step": {"type": "integer", "description": "Zero-based time step index."},
-                        "roman_numeral": {"type": "string", "description": "Roman numeral chord label (e.g. 'I', 'IV', 'V', 'vi')."},
+                        "roman_numeral": {
+                            "type": "string",
+                            "description": "Roman numeral chord label (e.g. 'I', 'IV', 'V7', 'vi', 'ii7'). Supports 7th chords.",
+                        },
+                        "root_pitch_class": {
+                            "type": "integer",
+                            "description": "Explicit root as pitch class 0-11. Use for chromatic/secondary-dominant chords not in the diatonic table. Overrides roman_numeral.",
+                        },
+                        "quality": {
+                            "type": "string",
+                            "enum": [
+                                "major", "minor", "diminished", "augmented",
+                                "dominant_7th", "major_7th", "minor_7th",
+                                "half_diminished_7th", "fully_diminished_7th",
+                                "minor_major_7th",
+                            ],
+                            "description": "Chord quality. Required with root_pitch_class, optional override with roman_numeral.",
+                        },
                     },
-                    "required": ["step", "roman_numeral"],
+                    "required": ["step"],
                 },
-                "description": "Optional explicit chord-per-step assignments using Roman numerals.",
+                "description": (
+                    "Explicit chord-per-step assignments. Use roman_numeral for diatonic chords "
+                    "(including 7ths like V7, ii7). Use root_pitch_class + quality for chromatic "
+                    "chords (e.g. secondary dominants: root_pitch_class=2, quality='dominant_7th' "
+                    "for V7/V in C major)."
+                ),
             },
             "voice_leading_max_interval": {
                 "type": "integer",
@@ -78,6 +100,18 @@ EXTRACT_TOOL = {
             "enable_bass_restrictions": {
                 "type": "boolean",
                 "description": "Restrict bass to root/fifth (or chord-specific allowed tones). Default true.",
+            },
+            "scale_constraint_hard": {
+                "type": "boolean",
+                "description": "If true, strictly enforce diatonic scale (no chromatic notes). Default false — allows chromaticism for secondary dominants.",
+            },
+            "diatonic_weight": {
+                "type": "integer",
+                "description": "Strength of diatonic preference when scale_constraint_hard is false. Higher = stronger pull toward diatonic. Default 2.",
+            },
+            "enable_resolution": {
+                "type": "boolean",
+                "description": "Enable tendency tone resolution (7th resolves down, leading tone resolves up) after dominant chords. Default true.",
             },
         },
         "required": ["key_root", "scale_type"],
@@ -177,6 +211,7 @@ class RequestMapper:
         diatonic_chords = self.theory.get('diatonic_chords', {})
         available_chords_info = {scale: list(chords.keys()) for scale, chords in diatonic_chords.items()}
 
+        secondary_doms = self.theory.get('secondary_dominants', {})
         system_prompt = (
             "You are a music theory assistant. Extract structured arrangement parameters "
             "from the user's natural language request. Use the apply_arrangement tool to "
@@ -187,6 +222,14 @@ class RequestMapper:
             f"Number of time steps in the melody: {num_steps}\n\n"
             "Pitch class mapping: 0=C, 1=C#/Db, 2=D, 3=Eb/D#, 4=E, 5=F, "
             "6=F#/Gb, 7=G, 8=Ab/G#, 9=A, 10=Bb/A#, 11=B\n\n"
+            "SEVENTH CHORDS: Diatonic 7th chords are available via Roman numerals "
+            "(e.g. V7, ii7, Imaj7, viio7). Use these in chord_sequence.\n\n"
+            "CHROMATIC CHORDS (secondary dominants, borrowed chords): Use "
+            "root_pitch_class + quality instead of roman_numeral. Example: V7/V in "
+            "C major = {\"step\": N, \"root_pitch_class\": 2, \"quality\": \"dominant_7th\"}.\n"
+            f"Secondary dominants reference: {json.dumps(secondary_doms)}\n\n"
+            "When chromatic chords are needed, set scale_constraint_hard to false "
+            "(default) so the solver allows non-diatonic tones.\n\n"
             "NOTE: Cadences and chord_sequence are only supported for scales with "
             "diatonic chord definitions (major, natural_minor, harmonic_minor, "
             "melodic_minor_ascending). For other scales, set cadence to 'none' "
@@ -214,6 +257,9 @@ class RequestMapper:
                 params.setdefault('per_voice_max_interval', None)
                 params.setdefault('enable_chord_completeness', True)
                 params.setdefault('enable_bass_restrictions', True)
+                params.setdefault('scale_constraint_hard', False)
+                params.setdefault('diatonic_weight', 2)
+                params.setdefault('enable_resolution', True)
                 return params
 
         raise RuntimeError("Claude did not return an apply_arrangement tool call.")
@@ -354,9 +400,13 @@ class MusicArranger:
             exclude_voices=[melody_voice],
         )
 
-        # 6. Scale constraint — keep all notes diatonic
-        solver.add_scale_constraint(constraints['key_root'], constraints['scale_type'],
-                                     exclude_voices=[melody_voice])
+        # 6. Scale constraint — soft by default to allow chromaticism
+        solver.add_scale_constraint(
+            constraints['key_root'], constraints['scale_type'],
+            exclude_voices=[melody_voice],
+            hard=constraints.get('scale_constraint_hard', False),
+            diatonic_weight=constraints.get('diatonic_weight', 2),
+        )
 
         # 7. Cadence
         cadence_type = constraints.get('cadence', 'none')
@@ -385,36 +435,68 @@ class MusicArranger:
         # 8. Explicit chord sequence
         enable_comp = constraints.get('enable_chord_completeness', True)
         enable_bass = constraints.get('enable_bass_restrictions', True)
+        enable_resolution = constraints.get('enable_resolution', True)
         if melody_voice == voice_names[-1]:
             enable_bass = False
         bass_voice = voice_names[-1]
 
         diatonic = self.theory.get('diatonic_chords', {}).get(constraints['scale_type'], {})
-        for chord_spec in constraints.get('chord_sequence', []):
+        chord_sequence = constraints.get('chord_sequence', [])
+        # Build step->index map for resolution lookahead
+        step_to_idx = {cs['step']: i for i, cs in enumerate(chord_sequence)}
+
+        for idx, chord_spec in enumerate(chord_sequence):
             step = chord_spec['step']
-            numeral = chord_spec['roman_numeral']
             if step >= num_steps:
                 continue
-            chord_info = diatonic.get(numeral)
-            if chord_info:
+
+            # Resolve root and quality — chromatic or diatonic
+            if 'root_pitch_class' in chord_spec:
+                absolute_root = chord_spec['root_pitch_class']
+                quality = chord_spec['quality']
+            elif 'roman_numeral' in chord_spec:
+                numeral = chord_spec['roman_numeral']
+                chord_info = diatonic.get(numeral)
+                if not chord_info:
+                    print(f"Warning: Roman numeral '{numeral}' not found in "
+                          f"{constraints['scale_type']} diatonic chords, skipping step {step}.")
+                    continue
                 absolute_root = (constraints['key_root'] + chord_info['root_degree']) % 12
-                solver.add_harmonic_constraint(step, absolute_root, chord_info['quality'],
-                                               exclude_voices=[melody_voice])
-                if enable_comp:
-                    solver.add_chord_completeness_constraint(
-                        step, absolute_root, chord_info['quality'],
-                        exclude_voices=[melody_voice])
-                if enable_bass and bass_voice not in [melody_voice]:
-                    solver.add_bass_restriction_constraint(
-                        step, absolute_root, chord_info['quality'],
-                        bass_voice=bass_voice)
-                # Prefer root in bass
-                solver.add_doubling_preference(step, absolute_root)
+                quality = chord_spec.get('quality', chord_info['quality'])
+            else:
+                continue  # no chord info at this step
+
+            solver.add_harmonic_constraint(step, absolute_root, quality,
+                                           exclude_voices=[melody_voice])
+            if enable_comp:
+                solver.add_chord_completeness_constraint(
+                    step, absolute_root, quality,
+                    exclude_voices=[melody_voice])
+            if enable_bass and bass_voice not in [melody_voice]:
+                solver.add_bass_restriction_constraint(
+                    step, absolute_root, quality,
+                    bass_voice=bass_voice)
+            # Prefer root in bass
+            solver.add_doubling_preference(step, absolute_root)
+
+            # Resolution constraint after dominant-type chords
+            if enable_resolution and 'dominant' in quality:
+                next_idx = idx + 1
+                if next_idx < len(chord_sequence):
+                    next_step = chord_sequence[next_idx]['step']
+                    if next_step < num_steps:
+                        solver.add_resolution_constraint(
+                            step, absolute_root, quality,
+                            next_step_index=next_step,
+                            exclude_voices=[melody_voice],
+                        )
 
         # 9. Voicing quality: soft constraints
         solver.add_unison_penalty()
         solver.add_spacing_constraint()
         solver.add_parallel_octave_penalty()
+        solver.add_contrary_motion_preference(
+            melody_voice=melody_voice, bass_voice=voice_names[-1])
 
         # 10. Solve
         print("Solving...")
