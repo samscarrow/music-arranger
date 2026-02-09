@@ -24,111 +24,12 @@ from pathlib import Path
 import re
 
 import torch
-import torch.nn as nn
 from torch.nn import functional as F
 
-# Add tools dir to path for event import
+# Add tools dir to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 from event import Header, Event, format_events, quarter_notes_per_bar
-
-# ============================================================================
-# MODEL ARCHITECTURE (Must match train.py exactly)
-# ============================================================================
-
-# Config will be loaded from checkpoint
-N_EMBD = None
-N_HEAD = None
-N_LAYER = None
-BLOCK_SIZE = 256
-
-
-class AttentionHead(nn.Module):
-    """Single attention head."""
-
-    def __init__(self, head_size):
-        super().__init__()
-        self.key = nn.Linear(N_EMBD, head_size, bias=False)
-        self.query = nn.Linear(N_EMBD, head_size, bias=False)
-        self.value = nn.Linear(N_EMBD, head_size, bias=False)
-        self.register_buffer('tril', torch.tril(torch.ones(BLOCK_SIZE, BLOCK_SIZE)))
-
-    def forward(self, x):
-        B, T, C = x.shape
-        k = self.key(x)
-        q = self.query(x)
-        wei = q @ k.transpose(-2, -1) * (C ** -0.5)
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
-        wei = F.softmax(wei, dim=-1)
-        v = self.value(x)
-        return wei @ v
-
-
-class MultiHeadAttention(nn.Module):
-    """Multi-head self-attention."""
-
-    def __init__(self, num_heads, head_size):
-        super().__init__()
-        self.heads = nn.ModuleList([AttentionHead(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(N_EMBD, N_EMBD)
-
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        return self.proj(out)
-
-
-class FeedForward(nn.Module):
-    """Position-wise feed-forward network."""
-
-    def __init__(self, n_embd):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
-            nn.ReLU(),
-            nn.Linear(4 * n_embd, n_embd),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class TransformerBlock(nn.Module):
-    """Single Transformer block."""
-
-    def __init__(self, n_embd, n_head):
-        super().__init__()
-        head_size = n_embd // n_head
-        self.sa = MultiHeadAttention(n_head, head_size)
-        self.ffwd = FeedForward(n_embd)
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.ln2 = nn.LayerNorm(n_embd)
-
-    def forward(self, x):
-        x = x + self.sa(self.ln1(x))
-        x = x + self.ffwd(self.ln2(x))
-        return x
-
-
-class BarbershopTransformer(nn.Module):
-    """NanoGPT Transformer for barbershop arrangement generation."""
-
-    def __init__(self, vocab_size):
-        super().__init__()
-        self.token_embedding_table = nn.Embedding(vocab_size, N_EMBD)
-        self.position_embedding_table = nn.Embedding(BLOCK_SIZE, N_EMBD)
-        self.blocks = nn.Sequential(*[TransformerBlock(N_EMBD, N_HEAD) for _ in range(N_LAYER)])
-        self.ln_f = nn.LayerNorm(N_EMBD)
-        self.lm_head = nn.Linear(N_EMBD, vocab_size)
-
-    def forward(self, idx):
-        B, T = idx.shape
-        tok_emb = self.token_embedding_table(idx)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=idx.device))
-        x = tok_emb + pos_emb
-        x = self.blocks(x)
-        x = self.ln_f(x)
-        logits = self.lm_head(x)
-        return logits
-
+from model import load_checkpoint
 
 # ============================================================================
 # CONFIG
@@ -137,6 +38,8 @@ class BarbershopTransformer(nn.Module):
 MODEL_PATH = "tools/barbershop_dataset/arranger_model.pt"
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 TEMPERATURE = 0.8  # <1.0 = more deterministic, >1.0 = more random
+TOP_K = 20         # Sample from top-k tokens within allowed set
+MAX_RETRIES = 3    # Retry sampling with higher temperature on failure
 OUTPUT_FILE = "harmonized_output.txt"
 METER = "12/8"  # Change this to match your melody's time signature
 
@@ -557,33 +460,16 @@ def load_model():
         print(f"   Run 'python tools/train.py' first to train the model.")
         return None, None, None
 
-    checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
-    config = checkpoint['config']
-    stoi = checkpoint['stoi']
-    itos = checkpoint['itos']
-
-    # Set global dimensions
-    global N_EMBD, N_HEAD, N_LAYER
-    N_EMBD = config['n_embd']
-    N_HEAD = config['n_head']
-    N_LAYER = config['n_layer']
-
-    model = BarbershopTransformer(len(stoi))
-    model.load_state_dict(checkpoint['model_state'])
-    model.to(DEVICE)
-    model.eval()
-
+    model, stoi, itos, _config = load_checkpoint(MODEL_PATH, device=DEVICE)
     return model, stoi, itos
 
 
 def format_duration(dur):
-    """Convert numeric duration to string format for tokens."""
-    # Common durations: 0.25 (16th), 0.5 (8th), 0.75 (dotted 8th), 1.0 (quarter), 2.0 (half)
-    dur_str = str(dur)
-    # Remove trailing zeros
-    if '.' in dur_str:
-        dur_str = dur_str.rstrip('0').rstrip('.')
-    return dur_str
+    """Convert numeric duration to string format matching tokenizer output.
+
+    Tokenizer uses f'{dur:.1f}' — always one decimal place.
+    """
+    return f"{dur:.1f}"
 
 
 def _parse_harmony_token(token: str) -> tuple[str, str] | None:
@@ -592,6 +478,83 @@ def _parse_harmony_token(token: str) -> tuple[str, str] | None:
     if m:
         return m.group(1), m.group(2)
     return None
+
+
+# Expected generation order after force-feeding [bar] [lead] [dur]
+_GENERATION_ORDER = ('chord', 'bass', 'bari', 'tenor')
+
+
+def build_token_masks(stoi):
+    """Group token indices by prefix for constrained decoding.
+
+    Returns dict mapping prefix name → set of valid token indices.
+    Called once at harmonization start.
+    """
+    masks = {}
+    for prefix in _GENERATION_ORDER:
+        key = f'[{prefix}:'
+        masks[prefix] = {idx for tok, idx in stoi.items() if tok.startswith(key)}
+    return masks
+
+
+def mask_logits(logits, allowed_indices):
+    """Set logits for disallowed tokens to -inf.
+
+    Args:
+        logits: (vocab_size,) tensor of raw logits for next token
+        allowed_indices: set of token indices that are permitted
+    Returns:
+        masked logits tensor (same shape)
+    """
+    mask = torch.full_like(logits, float('-inf'))
+    for idx in allowed_indices:
+        mask[idx] = 0.0
+    return logits + mask
+
+
+def constrained_sample(model, idx, allowed_indices, stoi, itos,
+                       temperature=TEMPERATURE, top_k=TOP_K,
+                       max_retries=MAX_RETRIES):
+    """Sample one token from the model, constrained to allowed_indices.
+
+    Applies logit masking, top-k filtering, and retry with temperature ramp.
+    Returns (token_string, updated_idx) or (None, idx) if all retries fail.
+    """
+    vocab_size = len(stoi)
+
+    for attempt in range(max_retries):
+        t = temperature * (1.0 + 0.5 * attempt)  # ramp: 0.8 → 1.2 → 1.6
+
+        idx_cond = idx[:, -model.block_size:]
+        logits, _ = model(idx_cond)
+        logits = logits[:, -1, :]  # last position
+
+        # Mask to allowed token types
+        logits = mask_logits(logits.squeeze(0), allowed_indices).unsqueeze(0)
+
+        # Apply temperature
+        logits = logits / t
+
+        # Top-k within allowed set
+        if top_k is not None and top_k < len(allowed_indices):
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < v[:, [-1]]] = float('-inf')
+
+        probs = F.softmax(logits, dim=-1)
+
+        # Check for degenerate distribution (all probability collapsed)
+        if torch.isnan(probs).any() or probs.max().item() < 1e-8:
+            continue
+
+        idx_next = torch.multinomial(probs, num_samples=1)
+        token = itos[idx_next.item()]
+
+        # Verify token is actually in the allowed set
+        if idx_next.item() in allowed_indices:
+            idx = torch.cat((idx, idx_next), dim=1)
+            return token, idx
+
+    return None, idx
 
 
 def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4"):
@@ -612,6 +575,12 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4"):
     print()
 
     header = Header(key="C", meter=meter)
+
+    # Build constrained decoding masks (once)
+    token_masks = build_token_masks(stoi)
+    for prefix, indices in token_masks.items():
+        print(f"  Token mask [{prefix}:*]: {len(indices)} allowed tokens")
+    print()
 
     # Start with key/meter context
     context_tokens = ["[key:C]", f"[meter:{meter}]"]
@@ -675,64 +644,41 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4"):
             print()
             continue
 
-        # 2. GENERATE harmony (chord + bass + bari + tenor)
-        harmony_tokens = []
-        max_harmony_tokens = 4  # chord, bass, bari, tenor
-
-        while len(harmony_tokens) < max_harmony_tokens:
-            # Crop context to block size
-            idx_cond = idx[:, -BLOCK_SIZE:]
-
-            # Get logits
-            logits = model(idx_cond)
-            logits = logits[:, -1, :] / TEMPERATURE
-            probs = F.softmax(logits, dim=-1)
-
-            # Sample next token
-            idx_next = torch.multinomial(probs, num_samples=1)
-            token = itos[idx_next.item()]
-
-            # STOP if model tries to start a new bar or end song
-            if token.startswith("[bar:") or token == "[song_end]":
-                print(f"    Model signaled next event, stopping generation")
-                break
-
-            # Accept harmony token
-            harmony_tokens.append(token)
-            idx = torch.cat((idx, idx_next), dim=1)
-
-            # Debug: show what was generated
-            if token.startswith("[chord:"):
-                print(f"      Predicted chord: {token}")
-            elif token.startswith("[bass:"):
-                print(f"      Predicted bass:  {token}")
-            elif token.startswith("[bari:"):
-                print(f"      Predicted bari:  {token}")
-            elif token.startswith("[tenor:"):
-                print(f"      Predicted tenor: {token}")
-
-        # 3. BUILD Event from generated tokens
-        real_bar = int(cumulative_offset // real_qn_per_bar) + 1
-
-        # Parse harmony tokens into voice fields
+        # 2. GENERATE harmony: chord → bass → bari → tenor (constrained)
         chord_val = None
         bass_val = None
         bari_val = None
         tenor_val = None
 
-        for ht in harmony_tokens:
-            parsed = _parse_harmony_token(ht)
+        for token_type in _GENERATION_ORDER:
+            token, idx = constrained_sample(
+                model, idx, token_masks[token_type], stoi, itos
+            )
+
+            if token is None:
+                print(f"      {token_type:5s}: FAILED (all retries exhausted, using rest)")
+                continue
+
+            parsed = _parse_harmony_token(token)
             if parsed is None:
                 continue
             tt, tv = parsed
+
             if tt == 'chord':
                 chord_val = tv
+                print(f"      Predicted chord: {token}")
             elif tt == 'bass':
                 bass_val = int(tv) if tv != 'rest' else None
+                print(f"      Predicted bass:  {token}")
             elif tt == 'bari':
                 bari_val = int(tv) if tv != 'rest' else None
+                print(f"      Predicted bari:  {token}")
             elif tt == 'tenor':
                 tenor_val = int(tv) if tv != 'rest' else None
+                print(f"      Predicted tenor: {token}")
+
+        # 3. BUILD Event from generated tokens
+        real_bar = int(cumulative_offset // real_qn_per_bar) + 1
 
         event = Event(
             bar=real_bar,

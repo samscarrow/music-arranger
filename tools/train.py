@@ -18,13 +18,18 @@ Dataset assumes: training_sequences.txt (original flat format)
   - Automatically reorders tokens during loading for pure arranger mode
 """
 
+import sys
+from pathlib import Path
+
 import torch
-import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset, DataLoader
 import os
 import re
-from pathlib import Path
+
+# Add tools dir to path for model import
+sys.path.insert(0, str(Path(__file__).parent))
+from model import build_model, save_checkpoint
 
 # ============================================================================
 # CONFIG
@@ -182,160 +187,6 @@ class BarbershopDataset(Dataset):
 
 
 # ============================================================================
-# MODEL (NanoGPT)
-# ============================================================================
-class AttentionHead(nn.Module):
-    """Single attention head."""
-
-    def __init__(self, head_size):
-        super().__init__()
-        self.key = nn.Linear(N_EMBD, head_size, bias=False)
-        self.query = nn.Linear(N_EMBD, head_size, bias=False)
-        self.value = nn.Linear(N_EMBD, head_size, bias=False)
-        self.register_buffer('tril', torch.tril(torch.ones(BLOCK_SIZE, BLOCK_SIZE)))
-        self.dropout = nn.Dropout(DROPOUT)
-
-    def forward(self, x):
-        B, T, C = x.shape
-        k = self.key(x)
-        q = self.query(x)
-        # Scaled dot-product attention
-        wei = q @ k.transpose(-2, -1) * (C ** -0.5)
-        # Causal mask: prevent attending to future tokens
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
-        wei = F.softmax(wei, dim=-1)
-        wei = self.dropout(wei)
-        v = self.value(x)
-        return wei @ v
-
-
-class MultiHeadAttention(nn.Module):
-    """Multi-head self-attention."""
-
-    def __init__(self, num_heads, head_size):
-        super().__init__()
-        self.heads = nn.ModuleList([AttentionHead(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(N_EMBD, N_EMBD)
-        self.dropout = nn.Dropout(DROPOUT)
-
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        return self.dropout(self.proj(out))
-
-
-class FeedForward(nn.Module):
-    """Position-wise feed-forward network."""
-
-    def __init__(self, n_embd):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
-            nn.ReLU(),
-            nn.Linear(4 * n_embd, n_embd),
-            nn.Dropout(DROPOUT),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class TransformerBlock(nn.Module):
-    """Single Transformer block: attention + feed-forward with residuals and LayerNorm."""
-
-    def __init__(self, n_embd, n_head):
-        super().__init__()
-        head_size = n_embd // n_head
-        self.sa = MultiHeadAttention(n_head, head_size)
-        self.ffwd = FeedForward(n_embd)
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.ln2 = nn.LayerNorm(n_embd)
-
-    def forward(self, x):
-        x = x + self.sa(self.ln1(x))
-        x = x + self.ffwd(self.ln2(x))
-        return x
-
-
-class BarbershopTransformer(nn.Module):
-    """NanoGPT: Lightweight Transformer for barbershop arrangement generation."""
-
-    def __init__(self, vocab_size):
-        super().__init__()
-        self.token_embedding_table = nn.Embedding(vocab_size, N_EMBD)
-        self.position_embedding_table = nn.Embedding(BLOCK_SIZE, N_EMBD)
-        self.blocks = nn.Sequential(*[Block(N_EMBD, N_HEAD) for _ in range(N_LAYER)])
-        self.ln_f = nn.LayerNorm(N_EMBD)
-        self.lm_head = nn.Linear(N_EMBD, vocab_size)
-
-    def forward(self, idx, targets=None):
-        B, T = idx.shape
-
-        # Token and position embeddings
-        tok_emb = self.token_embedding_table(idx)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=DEVICE))
-        x = tok_emb + pos_emb
-
-        # Transformer blocks
-        x = self.blocks(x)
-        x = self.ln_f(x)
-
-        # Output logits
-        logits = self.lm_head(x)
-
-        # Compute loss if targets provided
-        loss = None
-        if targets is not None:
-            B, T, C = logits.shape
-            logits = logits.view(B * T, C)
-            targets = targets.view(B * T)
-            loss = F.cross_entropy(logits, targets)
-
-        return logits, loss
-
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        """
-        Generate new tokens autoregressively.
-
-        Args:
-            idx: (B, T) tensor of token indices to start with
-            max_new_tokens: number of tokens to generate
-            temperature: controls randomness (1.0 = normal, <1.0 = more deterministic)
-            top_k: if set, only sample from top-k most likely tokens
-        """
-        for _ in range(max_new_tokens):
-            # Crop idx to BLOCK_SIZE if needed
-            idx_cond = idx[:, -BLOCK_SIZE:]
-
-            # Forward pass
-            logits, _ = self(idx_cond)
-
-            # Get logits for next token (last position)
-            logits = logits[:, -1, :]
-
-            # Apply temperature
-            logits = logits / temperature
-
-            # Top-k filtering
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = float('-inf')
-
-            # Sample from distribution
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-
-            # Append to sequence
-            idx = torch.cat([idx, idx_next], dim=1)
-
-        return idx
-
-
-# Override block name
-Block = TransformerBlock
-
-
-# ============================================================================
 # TRAINING
 # ============================================================================
 def train():
@@ -356,7 +207,16 @@ def train():
     dataset = BarbershopDataset(DATA_FILE, BLOCK_SIZE)
 
     # Initialize model
-    model = BarbershopTransformer(dataset.vocab_size).to(DEVICE)
+    config = {
+        'n_embd': N_EMBD,
+        'n_head': N_HEAD,
+        'n_layer': N_LAYER,
+        'block_size': BLOCK_SIZE,
+        'dropout': DROPOUT,
+        'vocab_size': dataset.vocab_size,
+    }
+    model = build_model(dataset.vocab_size, config, device=DEVICE).to(DEVICE)
+    model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
     print(f"Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -364,7 +224,6 @@ def train():
     print(f"🚀 Training for {MAX_ITERS} iterations...\n")
 
     # Training loop
-    model.train()
     for iteration in range(MAX_ITERS):
         # Sample batch
         batch_indices = torch.randint(0, len(dataset), (BATCH_SIZE,))
@@ -385,37 +244,11 @@ def train():
 
         # Checkpoint
         if iteration % EVAL_INTERVAL == 0 and iteration > 0:
-            torch.save(
-                {
-                    'model_state': model.state_dict(),
-                    'stoi': dataset.stoi,
-                    'itos': dataset.itos,
-                    'config': {
-                        'n_embd': N_EMBD,
-                        'n_head': N_HEAD,
-                        'n_layer': N_LAYER,
-                        'vocab_size': dataset.vocab_size,
-                    }
-                },
-                MODEL_PATH
-            )
+            save_checkpoint(MODEL_PATH, model, dataset.stoi, dataset.itos, config)
             print(f"   💾 Checkpoint saved to {MODEL_PATH}")
 
     # Final save
-    torch.save(
-        {
-            'model_state': model.state_dict(),
-            'stoi': dataset.stoi,
-            'itos': dataset.itos,
-            'config': {
-                'n_embd': N_EMBD,
-                'n_head': N_HEAD,
-                'n_layer': N_LAYER,
-                'vocab_size': dataset.vocab_size,
-            }
-        },
-        MODEL_PATH
-    )
+    save_checkpoint(MODEL_PATH, model, dataset.stoi, dataset.itos, config)
     print(f"\n✅ Training Complete!")
     print(f"Model saved to: {MODEL_PATH}")
 

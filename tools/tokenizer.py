@@ -18,6 +18,8 @@ import os
 from collections import Counter
 from pathlib import Path
 
+from event import quarter_notes_per_bar
+
 # ============================================================================
 # CONFIG
 # ============================================================================
@@ -135,7 +137,7 @@ def get_time_signature(score):
     return (4, 4)
 
 
-def extract_vertical_events(score, voices):
+def extract_vertical_events(score, voices, meter="4/4"):
     """
     Extract vertical events (chords) from the score.
 
@@ -188,8 +190,9 @@ def extract_vertical_events(score, voices):
     result = []
 
     for offset in sorted(events.keys()):
-        # Calculate bar number (assuming 4/4, quarter note = 1 beat)
-        bar_num = int(offset // 4) + 1
+        # Calculate bar number using meter-aware math
+        qn_per_bar = quarter_notes_per_bar(meter)
+        bar_num = int(offset // qn_per_bar) + 1
 
         voice_pitches = {}
         for voice_idx, voice_name in enumerate(voice_names):
@@ -249,7 +252,7 @@ def tokenize_score(file_path):
 
     # Extract vertical events (before transposition)
     try:
-        events = extract_vertical_events(score, voices)
+        events = extract_vertical_events(score, voices, meter=meter_str)
     except Exception as e:
         print(f"  FAILED to extract events: {e}")
         return None
