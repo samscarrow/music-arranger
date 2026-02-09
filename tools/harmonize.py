@@ -570,7 +570,7 @@ def constrained_sample(model, idx, allowed_mask, itos,
     return None, idx
 
 
-def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4"):
+def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4", quiet=False):
     """
     Harmonize a melody by feeding notes one-by-one to the model.
 
@@ -580,20 +580,23 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4"):
         stoi: String-to-index vocab dict
         itos: Index-to-string vocab dict
         meter: Time signature string (e.g., "4/4", "12/8")
+        quiet: If True, suppress per-note progress output
 
     Returns:
         (Header, list[Event])
     """
-    print(f"Harmonizing {len(melody_notes)}-note melody...")
-    print()
+    _log = (lambda *a, **kw: None) if quiet else print
+
+    _log(f"Harmonizing {len(melody_notes)}-note melody...")
+    _log()
 
     header = Header(key="C", meter=meter)
 
     # Build constrained decoding masks (once)
     token_masks = build_token_masks(stoi, device=DEVICE)
     for prefix, indices in token_masks.items():
-        print(f"  Token mask [{prefix}:*]: {len(indices)} allowed tokens")
-    print()
+        _log(f"  Token mask [{prefix}:*]: {len(indices)} allowed tokens")
+    _log()
 
     # Start with key/meter context
     context_tokens = ["[key:C]", f"[meter:{meter}]"]
@@ -615,7 +618,7 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4"):
     events = []
 
     for i, (pitch, duration) in enumerate(melody_notes, 1):
-        print(f"  Note {i:3d}/{len(melody_notes)}: MIDI {pitch:2d}, dur {duration}")
+        _log(f"  Note {i:3d}/{len(melody_notes)}: MIDI {pitch:2d}, dur {duration}")
 
         # Feed [bar:N] token to model for EVERY event
         bar_token = f"[bar:{model_bar_num}]"
@@ -626,7 +629,7 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4"):
         # 1. FORCE-FEED melody constraint tokens
         dur_str = _quantize_duration(duration, stoi)
         if dur_str != format_duration(duration):
-            print(f"    Quantized dur {format_duration(duration)} → {dur_str}")
+            _log(f"    Quantized dur {format_duration(duration)} → {dur_str}")
 
         constraint_tokens = [
             f"[lead:{pitch}]",
@@ -635,7 +638,7 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4"):
 
         for token in constraint_tokens:
             if token not in stoi:
-                print(f"    Warning: Token '{token}' not in vocab, skipping note")
+                _log(f"    Warning: Token '{token}' not in vocab, skipping note")
                 break
             token_idx = torch.tensor([[stoi[token]]], device=DEVICE)
             idx = torch.cat((idx, token_idx), dim=1)
@@ -653,7 +656,7 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4"):
                 )
 
                 if token is None:
-                    print(f"      {token_type:5s}: FAILED (all retries exhausted, using rest)")
+                    _log(f"      {token_type:5s}: FAILED (all retries exhausted, using rest)")
                     continue
 
                 parsed = _parse_harmony_token(token)
@@ -663,16 +666,16 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4"):
 
                 if tt == 'chord':
                     chord_val = tv
-                    print(f"      Predicted chord: {token}")
+                    _log(f"      Predicted chord: {token}")
                 elif tt == 'bass':
                     bass_val = int(tv) if tv != 'rest' else None
-                    print(f"      Predicted bass:  {token}")
+                    _log(f"      Predicted bass:  {token}")
                 elif tt == 'bari':
                     bari_val = int(tv) if tv != 'rest' else None
-                    print(f"      Predicted bari:  {token}")
+                    _log(f"      Predicted bari:  {token}")
                 elif tt == 'tenor':
                     tenor_val = int(tv) if tv != 'rest' else None
-                    print(f"      Predicted tenor: {token}")
+                    _log(f"      Predicted tenor: {token}")
 
             # 3. BUILD Event from generated tokens
             real_bar = int(cumulative_offset // real_qn_per_bar) + 1
@@ -696,7 +699,7 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4"):
             model_beat_in_bar -= model_beats_per_bar
             model_bar_num += 1
 
-        print()
+        _log()
 
     return header, events
 
