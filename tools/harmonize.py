@@ -472,6 +472,33 @@ def format_duration(dur):
     return f"{dur:.1f}"
 
 
+def _quantize_duration(dur, stoi):
+    """Snap a duration to the nearest [dur:*] token in the vocabulary.
+
+    Returns the formatted duration string (e.g. '1.0') or raises ValueError
+    if no dur tokens exist in the vocab.
+    """
+    formatted = format_duration(dur)
+    if f"[dur:{formatted}]" in stoi:
+        return formatted
+
+    # Collect all available durations from vocab
+    avail = []
+    for tok in stoi:
+        if tok.startswith("[dur:"):
+            val_str = tok[5:-1]  # strip [dur: and ]
+            try:
+                avail.append(float(val_str))
+            except ValueError:
+                continue
+
+    if not avail:
+        raise ValueError("No [dur:*] tokens in vocabulary")
+
+    nearest = min(avail, key=lambda v: abs(v - dur))
+    return format_duration(nearest)
+
+
 def _parse_harmony_token(token: str) -> tuple[str, str] | None:
     """Extract (type, value) from a token string like '[chord:MAJOR_TRIAD]'."""
     m = re.match(r'\[([a-z_]+):([^\]]+)\]', token)
@@ -484,75 +511,61 @@ def _parse_harmony_token(token: str) -> tuple[str, str] | None:
 _GENERATION_ORDER = ('chord', 'bass', 'bari', 'tenor')
 
 
-def build_token_masks(stoi):
-    """Group token indices by prefix for constrained decoding.
+def build_token_masks(stoi, device='cpu'):
+    """Precompute boolean mask tensors per token type for constrained decoding.
 
-    Returns dict mapping prefix name → set of valid token indices.
-    Called once at harmonization start.
+    Returns dict mapping prefix name → torch.bool tensor of shape (vocab_size,).
+    Called once at harmonization start; masks live on the target device.
     """
+    vocab_size = len(stoi)
     masks = {}
     for prefix in _GENERATION_ORDER:
         key = f'[{prefix}:'
-        masks[prefix] = {idx for tok, idx in stoi.items() if tok.startswith(key)}
+        m = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+        for tok, idx in stoi.items():
+            if tok.startswith(key):
+                m[idx] = True
+        masks[prefix] = m
     return masks
 
 
-def mask_logits(logits, allowed_indices):
-    """Set logits for disallowed tokens to -inf.
-
-    Args:
-        logits: (vocab_size,) tensor of raw logits for next token
-        allowed_indices: set of token indices that are permitted
-    Returns:
-        masked logits tensor (same shape)
-    """
-    mask = torch.full_like(logits, float('-inf'))
-    for idx in allowed_indices:
-        mask[idx] = 0.0
-    return logits + mask
-
-
-def constrained_sample(model, idx, allowed_indices, stoi, itos,
+def constrained_sample(model, idx, allowed_mask, itos,
                        temperature=TEMPERATURE, top_k=TOP_K,
                        max_retries=MAX_RETRIES):
-    """Sample one token from the model, constrained to allowed_indices.
+    """Sample one token, constrained to positions where allowed_mask is True.
 
-    Applies logit masking, top-k filtering, and retry with temperature ramp.
+    Uses reduced-space top-k: extracts only allowed logits, applies top-k and
+    softmax in that subspace, then maps back to vocab indices.
+
     Returns (token_string, updated_idx) or (None, idx) if all retries fail.
     """
-    vocab_size = len(stoi)
+    allowed_idx = allowed_mask.nonzero(as_tuple=True)[0]
 
     for attempt in range(max_retries):
         t = temperature * (1.0 + 0.5 * attempt)  # ramp: 0.8 → 1.2 → 1.6
 
         idx_cond = idx[:, -model.block_size:]
         logits, _ = model(idx_cond)
-        logits = logits[:, -1, :]  # last position
+        logits = logits[0, -1]  # (vocab_size,)
 
-        # Mask to allowed token types
-        logits = mask_logits(logits.squeeze(0), allowed_indices).unsqueeze(0)
-
-        # Apply temperature
-        logits = logits / t
+        # Extract logits for allowed tokens only
+        sub_logits = logits[allowed_idx] / t  # (n_allowed,)
 
         # Top-k within allowed set
-        if top_k is not None and top_k < len(allowed_indices):
-            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-            logits[logits < v[:, [-1]]] = float('-inf')
+        k = min(top_k, sub_logits.size(0)) if top_k else sub_logits.size(0)
+        topk_vals, topk_pos = torch.topk(sub_logits, k)
 
-        probs = F.softmax(logits, dim=-1)
+        probs = F.softmax(topk_vals, dim=-1)
 
-        # Check for degenerate distribution (all probability collapsed)
         if torch.isnan(probs).any() or probs.max().item() < 1e-8:
             continue
 
-        idx_next = torch.multinomial(probs, num_samples=1)
-        token = itos[idx_next.item()]
+        sampled_pos = torch.multinomial(probs, num_samples=1)
+        vocab_idx = allowed_idx[topk_pos[sampled_pos.item()]]
 
-        # Verify token is actually in the allowed set
-        if idx_next.item() in allowed_indices:
-            idx = torch.cat((idx, idx_next), dim=1)
-            return token, idx
+        idx_next = vocab_idx.view(1, 1)
+        idx = torch.cat((idx, idx_next), dim=1)
+        return itos[vocab_idx.item()], idx
 
     return None, idx
 
@@ -577,7 +590,7 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4"):
     header = Header(key="C", meter=meter)
 
     # Build constrained decoding masks (once)
-    token_masks = build_token_masks(stoi)
+    token_masks = build_token_masks(stoi, device=DEVICE)
     for prefix, indices in token_masks.items():
         print(f"  Token mask [{prefix}:*]: {len(indices)} allowed tokens")
     print()
@@ -611,81 +624,70 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4"):
             idx = torch.cat((idx, token_idx), dim=1)
 
         # 1. FORCE-FEED melody constraint tokens
+        dur_str = _quantize_duration(duration, stoi)
+        if dur_str != format_duration(duration):
+            print(f"    Quantized dur {format_duration(duration)} → {dur_str}")
+
         constraint_tokens = [
             f"[lead:{pitch}]",
-            f"[dur:{format_duration(duration)}]"
+            f"[dur:{dur_str}]"
         ]
 
-        dur_fed = False
         for token in constraint_tokens:
             if token not in stoi:
-                print(f"    Warning: Token '{token}' not in vocab, skipping")
-                if token.startswith("[dur:"):
-                    dur_fed = False
-                continue
-
+                print(f"    Warning: Token '{token}' not in vocab, skipping note")
+                break
             token_idx = torch.tensor([[stoi[token]]], device=DEVICE)
             idx = torch.cat((idx, token_idx), dim=1)
-            if token.startswith("[dur:"):
-                dur_fed = True
+        else:
+            # All constraint tokens fed successfully — generate harmony
+            chord_val = None
+            bass_val = None
+            bari_val = None
+            tenor_val = None
 
-        # If duration wasn't in vocab, skip this note entirely
-        if not dur_fed:
-            cumulative_offset += duration
-            model_beat_in_bar += duration
-            if model_beat_in_bar >= model_beats_per_bar:
-                model_beat_in_bar -= model_beats_per_bar
-                model_bar_num += 1
-            print()
-            continue
+            # 2. GENERATE harmony: chord → bass → bari → tenor (constrained)
+            for token_type in _GENERATION_ORDER:
+                token, idx = constrained_sample(
+                    model, idx, token_masks[token_type], itos
+                )
 
-        # 2. GENERATE harmony: chord → bass → bari → tenor (constrained)
-        chord_val = None
-        bass_val = None
-        bari_val = None
-        tenor_val = None
+                if token is None:
+                    print(f"      {token_type:5s}: FAILED (all retries exhausted, using rest)")
+                    continue
 
-        for token_type in _GENERATION_ORDER:
-            token, idx = constrained_sample(
-                model, idx, token_masks[token_type], stoi, itos
+                parsed = _parse_harmony_token(token)
+                if parsed is None:
+                    continue
+                tt, tv = parsed
+
+                if tt == 'chord':
+                    chord_val = tv
+                    print(f"      Predicted chord: {token}")
+                elif tt == 'bass':
+                    bass_val = int(tv) if tv != 'rest' else None
+                    print(f"      Predicted bass:  {token}")
+                elif tt == 'bari':
+                    bari_val = int(tv) if tv != 'rest' else None
+                    print(f"      Predicted bari:  {token}")
+                elif tt == 'tenor':
+                    tenor_val = int(tv) if tv != 'rest' else None
+                    print(f"      Predicted tenor: {token}")
+
+            # 3. BUILD Event from generated tokens
+            real_bar = int(cumulative_offset // real_qn_per_bar) + 1
+
+            event = Event(
+                bar=real_bar,
+                offset_qn=cumulative_offset,
+                lead=pitch,
+                tenor=tenor_val,
+                bari=bari_val,
+                bass=bass_val,
+                dur=duration,
+                chord=chord_val,
             )
-
-            if token is None:
-                print(f"      {token_type:5s}: FAILED (all retries exhausted, using rest)")
-                continue
-
-            parsed = _parse_harmony_token(token)
-            if parsed is None:
-                continue
-            tt, tv = parsed
-
-            if tt == 'chord':
-                chord_val = tv
-                print(f"      Predicted chord: {token}")
-            elif tt == 'bass':
-                bass_val = int(tv) if tv != 'rest' else None
-                print(f"      Predicted bass:  {token}")
-            elif tt == 'bari':
-                bari_val = int(tv) if tv != 'rest' else None
-                print(f"      Predicted bari:  {token}")
-            elif tt == 'tenor':
-                tenor_val = int(tv) if tv != 'rest' else None
-                print(f"      Predicted tenor: {token}")
-
-        # 3. BUILD Event from generated tokens
-        real_bar = int(cumulative_offset // real_qn_per_bar) + 1
-
-        event = Event(
-            bar=real_bar,
-            offset_qn=cumulative_offset,
-            lead=pitch,
-            tenor=tenor_val,
-            bari=bari_val,
-            bass=bass_val,
-            dur=duration,
-            chord=chord_val,
-        )
-        events.append(event)
+            events.append(event)
 
         # Update tracking
         cumulative_offset += duration
