@@ -35,9 +35,6 @@ def _assert_float_eq(actual, expected, msg="", tol=1e-6):
         raise AssertionError(f"{msg}\n  expected: {expected}\n  actual:   {actual}")
 
 
-class AssertionError(Exception):
-    pass
-
 
 # ============================================================================
 # Test 1: quarter_notes_per_bar
@@ -535,9 +532,6 @@ def main():
         try:
             test()
             passed += 1
-        except AssertionError as e:
-            print(f"  FAILED: {e}")
-            failed += 1
         except AssertionError as e:
             print(f"  FAILED: {e}")
             failed += 1
