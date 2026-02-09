@@ -37,8 +37,8 @@ from model import load_checkpoint
 
 MODEL_PATH = "tools/barbershop_dataset/arranger_model.pt"
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-TEMPERATURE = 0.8  # <1.0 = more deterministic, >1.0 = more random
-TOP_K = 20         # Sample from top-k tokens within allowed set
+TEMPERATURE = 0.7  # <1.0 = more deterministic, >1.0 = more random
+TOP_K = 16         # Sample from top-k tokens within allowed set
 MAX_RETRIES = 3    # Retry sampling with higher temperature on failure
 OUTPUT_FILE = "harmonized_output.txt"
 METER = "12/8"  # Change this to match your melody's time signature

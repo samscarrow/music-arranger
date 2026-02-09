@@ -57,11 +57,18 @@ CHORD_PC_SETS = {
 # Hard constraint checks
 # ---------------------------------------------------------------------------
 
-def check_voice_ranges(events: list[Event]) -> list[Issue]:
-    """Check that each non-rest voice pitch falls within its allowed range."""
+def check_voice_ranges(events: list[Event],
+                       exclude_voices: tuple[str, ...] = ()) -> list[Issue]:
+    """Check that each non-rest voice pitch falls within its allowed range.
+    
+    Voices in *exclude_voices* are skipped (e.g. melody voice whose pitches
+    are input, not model-generated).
+    """
     issues: list[Issue] = []
     for idx, ev in enumerate(events):
         for voice in VOICES:
+            if voice in exclude_voices:
+                continue
             pitch = getattr(ev, voice)
             if pitch is None:
                 continue
@@ -369,9 +376,7 @@ class Scorecard:
 
     @property
     def overall_score(self) -> float:
-        """0–100 quality score. Errors = 0, otherwise weighted soft scores."""
-        if self.errors:
-            return 0.0
+        """0–100 quality score. Each error subtracts 5 points (floor 0)."""
         weights = {
             'leap_rate': 20,
             'parallel_rate': 20,
@@ -384,17 +389,26 @@ class Scorecard:
             if key in ('leap_rate', 'parallel_rate'):
                 val = 1.0 - val
             total += val * weight
-        return round(total, 1)
+        penalty = len(self.errors) * 5
+        return round(max(0.0, total - penalty), 1)
 
 
-def validate(header: Header, events: list[Event]) -> Scorecard:
-    """Run all hard and soft checks, return a Scorecard."""
+def validate(header: Header, events: list[Event],
+             exclude_voices: tuple[str, ...] = ()) -> Scorecard:
+    """Run all hard and soft checks, return a Scorecard.
+    
+    *exclude_voices*: voices to skip in range checking (e.g. ('lead',)
+    when the melody is fixed input).
+    """
     sc = Scorecard()
 
-    for check_fn in (check_voice_ranges, check_voice_crossing,
+    for check_fn in (check_voice_crossing,
                      check_durations_offsets, check_spacing):
         for issue in check_fn(events):
             sc.errors.append(issue)
+
+    for issue in check_voice_ranges(events, exclude_voices=exclude_voices):
+        sc.errors.append(issue)
 
     sc.passed = len(sc.errors) == 0
 

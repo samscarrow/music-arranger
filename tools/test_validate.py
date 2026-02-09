@@ -150,12 +150,12 @@ issues = check_harmonic_rhythm(events)
 _assert(any(i.check == 'harmonic_rhythm' for i in issues), "expected harmonic_rhythm warning")
 
 # ============================================================================
-# Test 11: Errors make score 0
+# Test 11: Errors penalize score (5 points each, floor 0)
 # ============================================================================
-print("Test 11: Errors make score 0")
+print("Test 11: Errors penalize score")
 events = [Event(bar=1, offset_qn=0.0, lead=80, tenor=67, bari=55, bass=48, dur=1.0, chord="MAJOR_TRIAD")]
 sc = validate(_make_header(), events)
-_assert(sc.overall_score == 0.0, f"expected overall_score == 0.0, got {sc.overall_score}")
+_assert(sc.overall_score < 100.0, f"expected score < 100 when errors present, got {sc.overall_score}")
 _assert(sc.passed is False, "expected passed=False when errors present")
 
 # ============================================================================

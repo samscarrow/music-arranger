@@ -57,7 +57,7 @@ def run_single(melody, melody_name, model, stoi, itos, meter,
     )
     elapsed = time.time() - t0
 
-    card = validate(header, events)
+    card = validate(header, events, exclude_voices=('lead',))
 
     return {
         "tag": tag,
