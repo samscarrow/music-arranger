@@ -592,17 +592,12 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4"):
         device=DEVICE
     ).unsqueeze(0)
 
-    # CRITICAL: Bar tracking for MODEL INPUT uses 4.0 beats regardless of actual meter.
-    # This matches the tokenizer bug (line 192 in tokenizer.py: bar_num = int(offset // 4) + 1).
-    # The training data has this pattern, so the model expects it.
-    # TODO: Fix tokenizer to use actual meter, then retrain model.
     model_bar_num = 1
     model_beat_in_bar = 0.0
-    model_beats_per_bar = 4.0
+    model_beats_per_bar = quarter_notes_per_bar(meter)
 
-    # Real offset tracking for Event objects
     cumulative_offset = 0.0
-    real_qn_per_bar = quarter_notes_per_bar(meter)
+    real_qn_per_bar = model_beats_per_bar
 
     events = []
 

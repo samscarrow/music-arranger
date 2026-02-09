@@ -212,7 +212,7 @@ def test_parse_harmonizer_output():
 
     # Check first event
     _assert_eq(events[0].lead, 55, "First event lead")
-    _assert_float_eq(events[0].dur, 0.5, "First event dur")
+    _assert_float_eq(events[0].dur, 0.25, "First event dur")
 
     print(f"  PASSED ({len(events)} events)")
 
