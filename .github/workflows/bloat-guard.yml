@@ -1,0 +1,36 @@
+name: Bloat Guard
+
+on: [push, pull_request]
+
+jobs:
+  bloat-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reject tracked files > 5 MB
+        run: |
+          fail=0
+          while IFS= read -r -d '' f; do
+            s=$(wc -c < "$f")
+            if [ "$s" -gt 5000000 ]; then
+              echo "BLOAT: $f ($(( s / 1024 / 1024 )) MB)"
+              fail=1
+            fi
+          done < <(git ls-files -z)
+          if [ "$fail" -eq 1 ]; then
+            echo "::error::Tracked files exceed 5 MB limit. Add to .gitignore or use Git LFS."
+            exit 1
+          fi
+          echo "All tracked files under 5 MB ✓"
+
+      - name: Reject banned file extensions
+        run: |
+          banned=$(git ls-files | grep -iE '\.(pt|pth|pdf|mscz|mxl|musx|mscx|musicxml)$' || true)
+          if [ -n "$banned" ]; then
+            echo "BANNED extensions tracked:"
+            echo "$banned"
+            echo "::error::Binary/score files must not be tracked. Add to .gitignore."
+            exit 1
+          fi
+          echo "No banned extensions tracked ✓"
