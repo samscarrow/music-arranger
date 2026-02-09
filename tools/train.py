@@ -8,13 +8,14 @@ Architecture:
   - ~500-token vocabulary (chord types + voice pitches + metadata)
 
 Training Strategy:
-  - Melody-first causal ordering: [chord] [lead] -> [bass] [bari] [tenor]
+  - Melody-first causal ordering: [bar] [lead] [dur] -> [chord] [bass] [bari] [tenor]
+  - Model sees melody + duration, predicts chord choice + harmony voices
   - Random song chunks (256 tokens) with next-token prediction loss
   - Adam optimizer with learning rate 3e-4
   - Checkpoint every 500 iterations
 
 Dataset assumes: training_sequences.txt (original flat format)
-  - Automatically reorders tokens during loading for melody-first learning
+  - Automatically reorders tokens during loading for pure arranger mode
 """
 
 import torch
@@ -50,7 +51,9 @@ class BarbershopDataset(Dataset):
     Load and preprocess barbershop quartet training sequences.
 
     Automatically reorders tokens from physical order (bass, bari, lead, tenor)
-    to causal order (chord, lead -> bass, bari, tenor) for melody-first learning.
+    to causal order (lead, dur -> chord, bass, bari, tenor) for pure arranger mode.
+
+    In this mode, the model sees ONLY melody + duration, then predicts chord + harmony.
     """
 
     def __init__(self, text_file, block_size):
@@ -85,14 +88,14 @@ class BarbershopDataset(Dataset):
         Original format per event:
           [bar:N] [bass:M] [bari:M] [lead:M] [tenor:M] [dur:F] [chord:LABEL]
 
-        Reordered (melody first, then harmony):
-          [bar:N] [chord:LABEL] [lead:M] [bass:M] [bari:M] [tenor:M] [dur:F]
+        Reordered (melody first, then harmony + chord):
+          [bar:N] [lead:M] [dur:F] [chord:LABEL] [bass:M] [bari:M] [tenor:M]
 
         This way, the model sees:
           1. Bar number (position)
-          2. Chord (harmonic constraint)
-          3. Lead (melodic constraint)
-          Then predicts: bass, bari, tenor (the harmony)
+          2. Melody note (constraint)
+          3. Duration (constraint)
+          Then predicts: chord, bass, bari, tenor (chord choice + harmony)
         """
         tokens = raw_text.split()
         reordered = []
@@ -136,23 +139,23 @@ class BarbershopDataset(Dataset):
 
         Priority:
           1. [bar:N]      - position
-          2. [chord:X]    - harmonic constraint
-          3. [lead:M]     - melodic constraint
-          4. [bass:M]     - harmony (bass)
-          5. [bari:M]     - harmony (baritone)
-          6. [tenor:M]    - harmony (tenor)
-          7. [dur:F]      - duration
+          2. [lead:M]     - melodic constraint (INPUT)
+          3. [dur:F]      - duration (INPUT)
+          4. [chord:X]    - chord to predict (OUTPUT)
+          5. [bass:M]     - bass to predict (OUTPUT)
+          6. [bari:M]     - baritone to predict (OUTPUT)
+          7. [tenor:M]    - tenor to predict (OUTPUT)
 
         Returns reordered list of tokens.
         """
         order_priority = {
             'bar': 0,
-            'chord': 1,
-            'lead': 2,
-            'bass': 3,
-            'bari': 4,
-            'tenor': 5,
-            'dur': 6,
+            'lead': 1,
+            'dur': 2,
+            'chord': 3,
+            'bass': 4,
+            'bari': 5,
+            'tenor': 6,
         }
 
         def get_sort_key(token):
