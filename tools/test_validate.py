@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from event import Header, Event
 from validate_arrangement import (
     validate, check_voice_ranges, check_voice_crossing,
+    check_adjacent_crossing,
     check_durations_offsets, check_spacing, check_voice_leaps,
     check_parallel_fifths_octaves, check_chord_coverage,
     check_harmonic_rhythm, calc_leap_rate, calc_parallel_rate,
@@ -61,10 +62,10 @@ _assert(issues[0].check == 'voice_range', f"expected check='voice_range', got '{
 _assert(issues[0].level == 'error', f"expected level='error', got '{issues[0].level}'")
 
 # ============================================================================
-# Test 3: Voice crossing detected
+# Test 3: Non-adjacent voice crossing detected (bass > lead)
 # ============================================================================
-print("Test 3: Voice crossing detected")
-events = [Event(bar=1, offset_qn=0.0, lead=67, tenor=55, bari=55, bass=48, dur=1.0, chord="MAJOR_TRIAD")]
+print("Test 3: Non-adjacent voice crossing detected")
+events = [Event(bar=1, offset_qn=0.0, lead=50, tenor=67, bari=55, bass=60, dur=1.0, chord="MAJOR_TRIAD")]
 issues = check_voice_crossing(events)
 _assert(len(issues) > 0, "expected at least one crossing issue")
 _assert(issues[0].check == 'voice_crossing', f"expected check='voice_crossing', got '{issues[0].check}'")
@@ -183,6 +184,19 @@ result = subprocess.run(
     capture_output=True, text=True,
 )
 _assert(result.returncode == 1, f"expected exit code 1, got {result.returncode}")
+
+# ============================================================================
+# Test 14: Adjacent crossing is a warning, not an error
+# ============================================================================
+print("Test 14: Adjacent crossing is warning, not error")
+# lead(67) > tenor(55) — adjacent pair, should be warning not error
+events = [Event(bar=1, offset_qn=0.0, lead=67, tenor=55, bari=55, bass=48, dur=1.0, chord="MAJOR_TRIAD")]
+hard = check_voice_crossing(events)
+_assert(len(hard) == 0, f"adjacent crossing should not produce hard error, got {len(hard)}")
+soft = check_adjacent_crossing(events)
+_assert(len(soft) > 0, "expected adjacent_crossing warning")
+_assert(soft[0].check == 'adjacent_crossing', f"expected check='adjacent_crossing', got '{soft[0].check}'")
+_assert(soft[0].level == 'warning', f"expected level='warning', got '{soft[0].level}'")
 
 # ============================================================================
 # Summary

@@ -84,11 +84,18 @@ def check_voice_ranges(events: list[Event],
 
 
 def check_voice_crossing(events: list[Event]) -> list[Issue]:
-    """Check that voices do not cross: bass ≤ bari ≤ lead ≤ tenor."""
+    """Check for non-adjacent voice crossings (errors).
+
+    Adjacent crossings (bass↔bari, bari↔lead, lead↔tenor) are musically
+    valid in barbershop and reported as warnings via
+    ``check_adjacent_crossing``.  Non-adjacent crossings (bass>lead,
+    bass>tenor, bari>tenor) are hard errors.
+    """
     issues: list[Issue] = []
-    pairs = list(zip(VOICES, VOICES[1:]))  # (bass,bari), (bari,lead), (lead,tenor)
+    # Non-adjacent pairs: voices separated by ≥1 intermediate voice
+    non_adjacent = [('bass', 'lead'), ('bass', 'tenor'), ('bari', 'tenor')]
     for idx, ev in enumerate(events):
-        for lower, upper in pairs:
+        for lower, upper in non_adjacent:
             lo_pitch = getattr(ev, lower)
             hi_pitch = getattr(ev, upper)
             if lo_pitch is None or hi_pitch is None:
@@ -97,6 +104,26 @@ def check_voice_crossing(events: list[Event]) -> list[Issue]:
                 issues.append(Issue(
                     level='error',
                     check='voice_crossing',
+                    event_idx=idx,
+                    message=f"{lower}({lo_pitch}) > {upper}({hi_pitch})",
+                ))
+    return issues
+
+
+def check_adjacent_crossing(events: list[Event]) -> list[Issue]:
+    """Report adjacent-voice crossings as informational warnings."""
+    issues: list[Issue] = []
+    adjacent = list(zip(VOICES, VOICES[1:]))  # (bass,bari), (bari,lead), (lead,tenor)
+    for idx, ev in enumerate(events):
+        for lower, upper in adjacent:
+            lo_pitch = getattr(ev, lower)
+            hi_pitch = getattr(ev, upper)
+            if lo_pitch is None or hi_pitch is None:
+                continue
+            if lo_pitch > hi_pitch:
+                issues.append(Issue(
+                    level='warning',
+                    check='adjacent_crossing',
                     event_idx=idx,
                     message=f"{lower}({lo_pitch}) > {upper}({hi_pitch})",
                 ))
@@ -413,7 +440,8 @@ def validate(header: Header, events: list[Event],
     sc.passed = len(sc.errors) == 0
 
     for check_fn in (check_voice_leaps, check_parallel_fifths_octaves,
-                     check_chord_coverage, check_harmonic_rhythm):
+                     check_chord_coverage, check_harmonic_rhythm,
+                     check_adjacent_crossing):
         for issue in check_fn(events):
             sc.warnings.append(issue)
 

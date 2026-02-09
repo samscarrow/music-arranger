@@ -195,6 +195,24 @@ def print_summary(results, tag, model_path, device):
             me = sum(r['errors'] for r in mr) / len(mr)
             print(f"    {name:20s}  score={ms:5.1f}  errors={me:4.1f}  (n={len(mr)})")
 
+    # Top offenders: aggregate error_types and warning_types
+    from collections import Counter
+    err_agg = Counter()
+    warn_agg = Counter()
+    for r in results:
+        for k, v in r.get('error_types', {}).items():
+            err_agg[k] += v
+        for k, v in r.get('warning_types', {}).items():
+            warn_agg[k] += v
+    if err_agg:
+        print("  Top error types:")
+        for k, v in err_agg.most_common(5):
+            print(f"    {k:30s}  {v:4d}")
+    if warn_agg:
+        print("  Top warning types:")
+        for k, v in warn_agg.most_common(5):
+            print(f"    {k:30s}  {v:4d}")
+
     print("=" * 95)
     print()
 

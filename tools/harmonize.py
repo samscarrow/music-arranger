@@ -618,6 +618,34 @@ def constrained_sample(model, idx, allowed_idx, itos,
     return None, idx
 
 
+def filter_allowed_by_pitch(allowed_idx, itos, lo=None, hi=None):
+    """Return subset of allowed_idx whose MIDI pitches fall within [lo, hi].
+
+    Rest tokens (value 'rest') are always kept.  *lo*/*hi* of None means
+    unbounded in that direction.
+    """
+    keep = []
+    for i in range(allowed_idx.size(0)):
+        tok = itos[allowed_idx[i].item()]
+        parsed = _parse_harmony_token(tok)
+        if parsed is None:
+            keep.append(i)
+            continue
+        _typ, val = parsed
+        if val == 'rest':
+            keep.append(i)
+            continue
+        midi = int(val)
+        if lo is not None and midi < lo:
+            continue
+        if hi is not None and midi > hi:
+            continue
+        keep.append(i)
+    if not keep:
+        return allowed_idx  # safety: don't return empty
+    return allowed_idx[torch.tensor(keep, device=allowed_idx.device)]
+
+
 def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4", quiet=False,
                      temperature=TEMPERATURE, top_k=TOP_K,
                      chord_biases=CHORD_BIASES):
@@ -726,8 +754,44 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4", quiet=False,
                 tenor_val = None
 
                 # 2. GENERATE harmony: chord → bass → bari → tenor (constrained)
+                #
+                # Dynamic pitch guards:
+                #   Non-adjacent crossing prevention (hard):
+                #     bass ≤ lead, bari ≥ bass, tenor ≥ max(bass, bari)
+                #   Spacing limits (soft, for musicality):
+                #     bari-bass ≤ 19,  |tenor-lead| ≤ 12
+                _MAX_BARI_BASS = 19
+                _MAX_TENOR_LEAD = 12
+
                 for token_type in _GENERATION_ORDER:
                     _mask, allowed_idx = token_masks[token_type]
+
+                    if token_type == 'bass' and pitch is not None:
+                        allowed_idx = filter_allowed_by_pitch(
+                            allowed_idx, itos, hi=pitch)
+                    elif token_type == 'bari':
+                        lo = bass_val
+                        hi = (bass_val + _MAX_BARI_BASS) if bass_val is not None else None
+                        if lo is not None or hi is not None:
+                            allowed_idx = filter_allowed_by_pitch(
+                                allowed_idx, itos, lo=lo, hi=hi)
+                    elif token_type == 'tenor':
+                        # Non-adjacent: tenor ≥ max(bass, bari)
+                        lo_bound = max(
+                            v for v in (bass_val, bari_val) if v is not None
+                        ) if any(v is not None for v in (bass_val, bari_val)) else None
+                        # Spacing: within 12 of lead
+                        if pitch is not None:
+                            lo_t = pitch - _MAX_TENOR_LEAD
+                            hi_t = pitch + _MAX_TENOR_LEAD
+                            if lo_bound is not None:
+                                lo_t = max(lo_t, lo_bound)
+                            allowed_idx = filter_allowed_by_pitch(
+                                allowed_idx, itos, lo=lo_t, hi=hi_t)
+                        elif lo_bound is not None:
+                            allowed_idx = filter_allowed_by_pitch(
+                                allowed_idx, itos, lo=lo_bound)
+
                     bias = logit_biases.get(token_type)
                     token, idx = constrained_sample(
                         model, idx, allowed_idx, itos,

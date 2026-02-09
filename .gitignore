@@ -25,3 +25,6 @@ venv/
 gemini-conversation-*.json
 debug_unzip/
 bench_results.jsonl
+# Benchmark outputs
+bench_*.jsonl
+harmonized_output*.txt
