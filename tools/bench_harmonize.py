@@ -23,14 +23,8 @@ import time
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harmonize import (
-    harmonize_melody, load_model, TEST_MELODY, METER,
-    TEMPERATURE, TOP_K,
-)
+from harmonize import harmonize_melody, load_model, TEST_MELODY, METER
 from validate_arrangement import validate
-
-# Monkeypatch harmonize module globals for per-run config
-import harmonize as _harm_mod
 
 
 def run_single(melody, melody_name, model, stoi, itos, meter,
@@ -38,14 +32,13 @@ def run_single(melody, melody_name, model, stoi, itos, meter,
     """Run one harmonization + validation. Returns result dict."""
     if seed is not None:
         torch.manual_seed(seed)
-
-    # Set module-level config so constrained_sample picks them up
-    _harm_mod.TEMPERATURE = temperature
-    _harm_mod.TOP_K = top_k
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
 
     t0 = time.time()
     header, events = harmonize_melody(
-        melody, model, stoi, itos, meter=meter, quiet=True
+        melody, model, stoi, itos, meter=meter, quiet=True,
+        temperature=temperature, top_k=top_k
     )
     elapsed = time.time() - t0
 
@@ -197,10 +190,6 @@ def main():
         for r in results:
             f.write(json.dumps(r) + "\n")
     print(f"\nResults written to {args.output}")
-
-    # Restore defaults
-    _harm_mod.TEMPERATURE = TEMPERATURE
-    _harm_mod.TOP_K = TOP_K
 
     print_summary(results)
     return 0

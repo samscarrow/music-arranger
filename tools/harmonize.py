@@ -461,6 +461,7 @@ def load_model():
         return None, None, None
 
     model, stoi, itos, _config = load_checkpoint(MODEL_PATH, device=DEVICE)
+    model.eval()
     return model, stoi, itos
 
 
@@ -512,12 +513,13 @@ _GENERATION_ORDER = ('chord', 'bass', 'bari', 'tenor')
 
 
 def build_token_masks(stoi, device='cpu'):
-    """Precompute boolean mask tensors per token type for constrained decoding.
+    """Precompute boolean masks and allowed index tensors per token type.
 
-    Returns dict mapping prefix name → torch.bool tensor of shape (vocab_size,).
-    Called once at harmonization start; masks live on the target device.
+    Returns dict mapping prefix name → (bool_mask, allowed_indices).
+    Bool mask has shape (vocab_size,); allowed_indices is a LongTensor of
+    valid token positions. Called once at harmonization start.
     """
-    vocab_size = len(stoi)
+    vocab_size = max(stoi.values()) + 1
     masks = {}
     for prefix in _GENERATION_ORDER:
         key = f'[{prefix}:'
@@ -525,22 +527,20 @@ def build_token_masks(stoi, device='cpu'):
         for tok, idx in stoi.items():
             if tok.startswith(key):
                 m[idx] = True
-        masks[prefix] = m
+        masks[prefix] = (m, m.nonzero(as_tuple=True)[0])
     return masks
 
 
-def constrained_sample(model, idx, allowed_mask, itos,
+def constrained_sample(model, idx, allowed_idx, itos,
                        temperature=TEMPERATURE, top_k=TOP_K,
                        max_retries=MAX_RETRIES):
-    """Sample one token, constrained to positions where allowed_mask is True.
+    """Sample one token, constrained to allowed_idx positions.
 
     Uses reduced-space top-k: extracts only allowed logits, applies top-k and
     softmax in that subspace, then maps back to vocab indices.
 
     Returns (token_string, updated_idx) or (None, idx) if all retries fail.
     """
-    allowed_idx = allowed_mask.nonzero(as_tuple=True)[0]
-
     for attempt in range(max_retries):
         t = temperature * (1.0 + 0.5 * attempt)  # ramp: 0.8 → 1.2 → 1.6
 
@@ -570,7 +570,8 @@ def constrained_sample(model, idx, allowed_mask, itos,
     return None, idx
 
 
-def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4", quiet=False):
+def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4", quiet=False,
+                     temperature=TEMPERATURE, top_k=TOP_K):
     """
     Harmonize a melody by feeding notes one-by-one to the model.
 
@@ -581,6 +582,8 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4", quiet=False):
         itos: Index-to-string vocab dict
         meter: Time signature string (e.g., "4/4", "12/8")
         quiet: If True, suppress per-note progress output
+        temperature: Sampling temperature (lower = more deterministic)
+        top_k: Restrict sampling to top-k tokens within allowed set
 
     Returns:
         (Header, list[Event])
@@ -594,19 +597,29 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4", quiet=False):
 
     # Build constrained decoding masks (once)
     token_masks = build_token_masks(stoi, device=DEVICE)
-    for prefix, indices in token_masks.items():
-        _log(f"  Token mask [{prefix}:*]: {len(indices)} allowed tokens")
+    for prefix, (mask, aidx) in token_masks.items():
+        _log(f"  Token mask [{prefix}:*]: {int(mask.sum().item())} allowed tokens")
     _log()
 
     # Start with key/meter context
-    context_tokens = ["[key:C]", f"[meter:{meter}]"]
+    meter_token = f"[meter:{meter}]"
+    if meter_token not in stoi:
+        avail = [t for t in stoi if t.startswith("[meter:")]
+        _log(f"    Warning: {meter_token} not in vocab, available: {avail}")
+        # Fall back to 4/4 as closest universal default
+        meter_token = "[meter:4/4]" if "[meter:4/4]" in stoi else avail[0]
+        _log(f"    Using {meter_token} instead")
+    context_tokens = ["[key:C]", meter_token]
 
-    # Convert to indices for initial context
+    missing = [t for t in context_tokens if t not in stoi]
+    if missing:
+        raise ValueError(f"Missing context tokens in vocab: {missing}")
+
     idx = torch.tensor(
-        [stoi.get(t, 0) for t in context_tokens],
+        [[stoi[t] for t in context_tokens]],
         dtype=torch.long,
         device=DEVICE
-    ).unsqueeze(0)
+    )
 
     model_bar_num = 1
     model_beat_in_bar = 0.0
@@ -617,89 +630,92 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4", quiet=False):
 
     events = []
 
-    for i, (pitch, duration) in enumerate(melody_notes, 1):
-        _log(f"  Note {i:3d}/{len(melody_notes)}: MIDI {pitch:2d}, dur {duration}")
+    with torch.inference_mode():
+        for i, (pitch, duration) in enumerate(melody_notes, 1):
+            _log(f"  Note {i:3d}/{len(melody_notes)}: MIDI {pitch:2d}, dur {duration}")
 
-        # Feed [bar:N] token to model for EVERY event
-        bar_token = f"[bar:{model_bar_num}]"
-        if bar_token in stoi:
-            token_idx = torch.tensor([[stoi[bar_token]]], device=DEVICE)
-            idx = torch.cat((idx, token_idx), dim=1)
+            # Feed [bar:N] token to model for EVERY event
+            bar_token = f"[bar:{model_bar_num}]"
+            if bar_token in stoi:
+                token_idx = torch.tensor([[stoi[bar_token]]], device=DEVICE)
+                idx = torch.cat((idx, token_idx), dim=1)
 
-        # 1. FORCE-FEED melody constraint tokens
-        dur_str = _quantize_duration(duration, stoi)
-        if dur_str != format_duration(duration):
-            _log(f"    Quantized dur {format_duration(duration)} → {dur_str}")
+            # 1. FORCE-FEED melody constraint tokens
+            dur_str = _quantize_duration(duration, stoi)
+            if dur_str != format_duration(duration):
+                _log(f"    Quantized dur {format_duration(duration)} → {dur_str}")
 
-        constraint_tokens = [
-            f"[lead:{pitch}]",
-            f"[dur:{dur_str}]"
-        ]
+            constraint_tokens = [
+                f"[lead:{pitch}]",
+                f"[dur:{dur_str}]"
+            ]
 
-        for token in constraint_tokens:
-            if token not in stoi:
-                _log(f"    Warning: Token '{token}' not in vocab, skipping note")
-                break
-            token_idx = torch.tensor([[stoi[token]]], device=DEVICE)
-            idx = torch.cat((idx, token_idx), dim=1)
-        else:
-            # All constraint tokens fed successfully — generate harmony
-            chord_val = None
-            bass_val = None
-            bari_val = None
-            tenor_val = None
+            for token in constraint_tokens:
+                if token not in stoi:
+                    _log(f"    Warning: Token '{token}' not in vocab, skipping note")
+                    break
+                token_idx = torch.tensor([[stoi[token]]], device=DEVICE)
+                idx = torch.cat((idx, token_idx), dim=1)
+            else:
+                # All constraint tokens fed successfully — generate harmony
+                chord_val = None
+                bass_val = None
+                bari_val = None
+                tenor_val = None
 
-            # 2. GENERATE harmony: chord → bass → bari → tenor (constrained)
-            for token_type in _GENERATION_ORDER:
-                token, idx = constrained_sample(
-                    model, idx, token_masks[token_type], itos
+                # 2. GENERATE harmony: chord → bass → bari → tenor (constrained)
+                for token_type in _GENERATION_ORDER:
+                    _mask, allowed_idx = token_masks[token_type]
+                    token, idx = constrained_sample(
+                        model, idx, allowed_idx, itos,
+                        temperature=temperature, top_k=top_k
+                    )
+
+                    if token is None:
+                        _log(f"      {token_type:5s}: FAILED (all retries exhausted, using rest)")
+                        continue
+
+                    parsed = _parse_harmony_token(token)
+                    if parsed is None:
+                        continue
+                    tt, tv = parsed
+
+                    if tt == 'chord':
+                        chord_val = tv
+                        _log(f"      Predicted chord: {token}")
+                    elif tt == 'bass':
+                        bass_val = int(tv) if tv != 'rest' else None
+                        _log(f"      Predicted bass:  {token}")
+                    elif tt == 'bari':
+                        bari_val = int(tv) if tv != 'rest' else None
+                        _log(f"      Predicted bari:  {token}")
+                    elif tt == 'tenor':
+                        tenor_val = int(tv) if tv != 'rest' else None
+                        _log(f"      Predicted tenor: {token}")
+
+                # 3. BUILD Event from generated tokens
+                real_bar = int(cumulative_offset // real_qn_per_bar) + 1
+
+                event = Event(
+                    bar=real_bar,
+                    offset_qn=cumulative_offset,
+                    lead=pitch,
+                    tenor=tenor_val,
+                    bari=bari_val,
+                    bass=bass_val,
+                    dur=duration,
+                    chord=chord_val,
                 )
+                events.append(event)
 
-                if token is None:
-                    _log(f"      {token_type:5s}: FAILED (all retries exhausted, using rest)")
-                    continue
+            # Update tracking
+            cumulative_offset += duration
+            model_beat_in_bar += duration
+            if model_beat_in_bar >= model_beats_per_bar:
+                model_beat_in_bar -= model_beats_per_bar
+                model_bar_num += 1
 
-                parsed = _parse_harmony_token(token)
-                if parsed is None:
-                    continue
-                tt, tv = parsed
-
-                if tt == 'chord':
-                    chord_val = tv
-                    _log(f"      Predicted chord: {token}")
-                elif tt == 'bass':
-                    bass_val = int(tv) if tv != 'rest' else None
-                    _log(f"      Predicted bass:  {token}")
-                elif tt == 'bari':
-                    bari_val = int(tv) if tv != 'rest' else None
-                    _log(f"      Predicted bari:  {token}")
-                elif tt == 'tenor':
-                    tenor_val = int(tv) if tv != 'rest' else None
-                    _log(f"      Predicted tenor: {token}")
-
-            # 3. BUILD Event from generated tokens
-            real_bar = int(cumulative_offset // real_qn_per_bar) + 1
-
-            event = Event(
-                bar=real_bar,
-                offset_qn=cumulative_offset,
-                lead=pitch,
-                tenor=tenor_val,
-                bari=bari_val,
-                bass=bass_val,
-                dur=duration,
-                chord=chord_val,
-            )
-            events.append(event)
-
-        # Update tracking
-        cumulative_offset += duration
-        model_beat_in_bar += duration
-        if model_beat_in_bar >= model_beats_per_bar:
-            model_beat_in_bar -= model_beats_per_bar
-            model_bar_num += 1
-
-        _log()
+            _log()
 
     return header, events
 
