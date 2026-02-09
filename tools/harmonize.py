@@ -43,6 +43,11 @@ MAX_RETRIES = 3    # Retry sampling with higher temperature on failure
 OUTPUT_FILE = "harmonized_output.txt"
 METER = "12/8"  # Change this to match your melody's time signature
 
+# Default logit biases: None (model's learned distribution is used as-is).
+# Set to a dict like {'[chord:MAJOR_TRIAD]': 0.5, '[chord:DOM7]': 0.3}
+# to nudge chord selection. Use bench_harmonize.py --no-bias vs default to compare.
+CHORD_BIASES = None
+
 # ============================================================================
 # TEST MELODY: "She's Always a Woman" (Billy Joel) - Transposed to C major
 # Extracted from shes-always-a-woman-billy-joel-Voice.mxl (400 notes, -3 semitones)
@@ -512,32 +517,69 @@ def _parse_harmony_token(token: str) -> tuple[str, str] | None:
 _GENERATION_ORDER = ('chord', 'bass', 'bari', 'tenor')
 
 
-def build_token_masks(stoi, device='cpu'):
+def build_token_masks(stoi, device='cpu', voice_ranges=None):
     """Precompute boolean masks and allowed index tensors per token type.
 
     Returns dict mapping prefix name → (bool_mask, allowed_indices).
     Bool mask has shape (vocab_size,); allowed_indices is a LongTensor of
     valid token positions. Called once at harmonization start.
+
+    If *voice_ranges* is provided (dict of voice → (lo, hi) MIDI range),
+    bass/bari/tenor masks are restricted to tokens within the given range.
     """
     vocab_size = max(stoi.values()) + 1
     masks = {}
     for prefix in _GENERATION_ORDER:
         key = f'[{prefix}:'
+        lo, hi = None, None
+        if voice_ranges and prefix in voice_ranges:
+            lo, hi = voice_ranges[prefix]
         m = torch.zeros(vocab_size, dtype=torch.bool, device=device)
         for tok, idx in stoi.items():
-            if tok.startswith(key):
-                m[idx] = True
+            if not tok.startswith(key):
+                continue
+            # Apply range filter for voice tokens (not chord)
+            if lo is not None:
+                val = tok[len(key):-1]  # e.g. "55" or "rest"
+                if val != 'rest':
+                    pitch = int(val)
+                    if pitch < lo or pitch > hi:
+                        continue
+            m[idx] = True
         masks[prefix] = (m, m.nonzero(as_tuple=True)[0])
     return masks
 
 
+def build_logit_biases(token_masks, stoi, itos, bias_dict, device='cpu'):
+    """Precompute logit bias tensors aligned to each prefix's allowed_idx.
+
+    Returns dict mapping prefix → bias tensor (same length as allowed_idx),
+    or empty dict if bias_dict is None/empty.
+    """
+    if not bias_dict:
+        return {}
+    biases = {}
+    for prefix, (_mask, allowed_idx) in token_masks.items():
+        bias = torch.zeros(allowed_idx.size(0), device=device)
+        for i, vocab_idx in enumerate(allowed_idx):
+            tok = itos[vocab_idx.item()]
+            if tok in bias_dict:
+                bias[i] = bias_dict[tok]
+        if bias.any():
+            biases[prefix] = bias
+    return biases
+
+
 def constrained_sample(model, idx, allowed_idx, itos,
                        temperature=TEMPERATURE, top_k=TOP_K,
-                       max_retries=MAX_RETRIES):
+                       max_retries=MAX_RETRIES, logit_bias=None):
     """Sample one token, constrained to allowed_idx positions.
 
     Uses reduced-space top-k: extracts only allowed logits, applies top-k and
     softmax in that subspace, then maps back to vocab indices.
+
+    If *logit_bias* is provided (Tensor of shape (n_allowed,)), it is added
+    to the sub-logits before temperature scaling and top-k.
 
     Returns (token_string, updated_idx) or (None, idx) if all retries fail.
     """
@@ -549,7 +591,13 @@ def constrained_sample(model, idx, allowed_idx, itos,
         logits = logits[0, -1]  # (vocab_size,)
 
         # Extract logits for allowed tokens only
-        sub_logits = logits[allowed_idx] / t  # (n_allowed,)
+        sub_logits = logits[allowed_idx]  # (n_allowed,)
+
+        # Apply logit biases before temperature scaling
+        if logit_bias is not None:
+            sub_logits = sub_logits + logit_bias
+
+        sub_logits = sub_logits / t
 
         # Top-k within allowed set
         k = min(top_k, sub_logits.size(0)) if top_k else sub_logits.size(0)
@@ -571,7 +619,8 @@ def constrained_sample(model, idx, allowed_idx, itos,
 
 
 def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4", quiet=False,
-                     temperature=TEMPERATURE, top_k=TOP_K):
+                     temperature=TEMPERATURE, top_k=TOP_K,
+                     chord_biases=CHORD_BIASES):
     """
     Harmonize a melody by feeding notes one-by-one to the model.
 
@@ -582,6 +631,9 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4", quiet=False,
         itos: Index-to-string vocab dict
         meter: Time signature string (e.g., "4/4", "12/8")
         quiet: If True, suppress per-note progress output
+        temperature: Sampling temperature (lower = more deterministic)
+        top_k: Restrict sampling to top-k tokens within allowed set
+        chord_biases: Dict of token string → bias value, or None to disable
         temperature: Sampling temperature (lower = more deterministic)
         top_k: Restrict sampling to top-k tokens within allowed set
 
@@ -595,10 +647,20 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4", quiet=False,
 
     header = Header(key="C", meter=meter)
 
-    # Build constrained decoding masks (once)
-    token_masks = build_token_masks(stoi, device=DEVICE)
+    # Build constrained decoding masks (once), restricting voice ranges
+    voice_ranges = {
+        'bass':  (36, 62),
+        'bari':  (50, 72),
+        'tenor': (46, 69),
+    }
+    token_masks = build_token_masks(stoi, device=DEVICE, voice_ranges=voice_ranges)
     for prefix, (mask, aidx) in token_masks.items():
         _log(f"  Token mask [{prefix}:*]: {int(mask.sum().item())} allowed tokens")
+
+    # Precompute logit bias tensors
+    logit_biases = build_logit_biases(token_masks, stoi, itos, chord_biases, device=DEVICE)
+    if logit_biases:
+        _log(f"  Logit biases active for: {', '.join(logit_biases.keys())}")
     _log()
 
     # Start with key/meter context
@@ -666,9 +728,11 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4", quiet=False,
                 # 2. GENERATE harmony: chord → bass → bari → tenor (constrained)
                 for token_type in _GENERATION_ORDER:
                     _mask, allowed_idx = token_masks[token_type]
+                    bias = logit_biases.get(token_type)
                     token, idx = constrained_sample(
                         model, idx, allowed_idx, itos,
-                        temperature=temperature, top_k=top_k
+                        temperature=temperature, top_k=top_k,
+                        logit_bias=bias
                     )
 
                     if token is None:
