@@ -2,8 +2,25 @@ __pycache__/
 *.pyc
 venv/
 .env
-*.musicxml
 .gemini/
 .codex/
+
+# Model checkpoints
 *.pt
 *.pth
+
+# Score / binary files (kept locally, not in git)
+*.pdf
+*.mscz
+*.mxl
+*.musx
+*.musicxml
+*.xml
+*.mscx
+
+# One-offs
+*.ahk
+*.log
+*.save
+gemini-conversation-*.json
+debug_unzip/
