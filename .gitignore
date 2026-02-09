@@ -5,3 +5,5 @@ venv/
 *.musicxml
 .gemini/
 .codex/
+*.pt
+*.pth
