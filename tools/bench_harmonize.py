@@ -12,10 +12,13 @@ Usage:
     python tools/bench_harmonize.py --repeat 3 --seed 42
     python tools/bench_harmonize.py --output results.jsonl
     python tools/bench_harmonize.py --notes 50                # first 50 notes only
+    python tools/bench_harmonize.py --tag baseline --model old_model.pt
+    python tools/bench_harmonize.py --device cpu --meter 4/4
 """
 
 import argparse
 import json
+import subprocess
 import sys
 import os
 import time
@@ -23,12 +26,24 @@ import time
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harmonize import harmonize_melody, load_model, TEST_MELODY, METER
+from harmonize import harmonize_melody, TEST_MELODY, METER, MODEL_PATH, DEVICE
+from model import load_checkpoint
 from validate_arrangement import validate
 
 
+def _git_short_sha():
+    """Return short git SHA of HEAD, or 'unknown' on failure."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL, text=True
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
 def run_single(melody, melody_name, model, stoi, itos, meter,
-               temperature, top_k, seed=None):
+               temperature, top_k, tag, device, model_path, seed=None):
     """Run one harmonization + validation. Returns result dict."""
     if seed is not None:
         torch.manual_seed(seed)
@@ -45,6 +60,10 @@ def run_single(melody, melody_name, model, stoi, itos, meter,
     card = validate(header, events)
 
     return {
+        "tag": tag,
+        "model": model_path,
+        "meter": meter,
+        "device": device,
         "melody": melody_name,
         "temperature": temperature,
         "top_k": top_k,
@@ -59,12 +78,17 @@ def run_single(melody, melody_name, model, stoi, itos, meter,
     }
 
 
-def print_summary(results):
+def print_summary(results, tag, model_path, meter, device):
     """Print a summary table to stdout."""
     print()
     print("=" * 90)
     print("  BENCHMARK SUMMARY")
     print("=" * 90)
+    print(f"  Tag:    {tag}")
+    print(f"  Model:  {model_path}")
+    print(f"  Meter:  {meter}")
+    print(f"  Device: {device}")
+    print()
 
     header_fmt = (
         f"  {'temp':>5s}  {'top_k':>5s}  {'score':>6s}  {'err':>4s}  "
@@ -92,11 +116,11 @@ def print_summary(results):
     # Aggregates
     scores = [r["score"] for r in results]
     errors = [r["errors"] for r in results]
-    print(f"  Runs:       {len(results)}")
-    print(f"  Mean score: {sum(scores) / len(scores):.1f}")
-    print(f"  Best score: {max(scores):.1f}")
+    print(f"  Runs:        {len(results)}")
+    print(f"  Mean score:  {sum(scores) / len(scores):.1f}")
+    print(f"  Best score:  {max(scores):.1f}")
     print(f"  Mean errors: {sum(errors) / len(errors):.1f}")
-    print(f"  Total time: {sum(r['elapsed_sec'] for r in results):.1f}s")
+    print(f"  Total time:  {sum(r['elapsed_sec'] for r in results):.1f}s")
     print("=" * 90)
     print()
 
@@ -104,6 +128,22 @@ def print_summary(results):
 def main():
     parser = argparse.ArgumentParser(
         description="Benchmark harmonizer across parameter sweeps"
+    )
+    parser.add_argument(
+        "--tag", type=str, default=None,
+        help="Label for this run (default: git short SHA)"
+    )
+    parser.add_argument(
+        "--model", type=str, default=None,
+        help=f"Model checkpoint path (default: {MODEL_PATH})"
+    )
+    parser.add_argument(
+        "--meter", type=str, default=None,
+        help=f"Time signature (default: {METER})"
+    )
+    parser.add_argument(
+        "--device", type=str, choices=["cpu", "cuda"], default=None,
+        help=f"Force device (default: auto = {DEVICE})"
     )
     parser.add_argument(
         "--temps", type=float, nargs="+",
@@ -133,12 +173,19 @@ def main():
     )
     args = parser.parse_args()
 
-    # Load model once
-    print("Loading model...")
-    model, stoi, itos = load_model()
-    if model is None:
-        print("ERROR: Model not found. Run 'python tools/train.py' first.")
+    # Resolve defaults
+    tag = args.tag or _git_short_sha()
+    model_path = args.model or MODEL_PATH
+    meter = args.meter or METER
+    device = args.device or DEVICE
+
+    # Load model
+    print(f"Loading model from {model_path}...")
+    if not os.path.exists(model_path):
+        print(f"ERROR: Model not found at {model_path}")
         return 1
+    model, stoi, itos, _config = load_checkpoint(model_path, device=device)
+    model.eval()
 
     # Prepare melody
     melody = TEST_MELODY
@@ -155,6 +202,8 @@ def main():
     ]
 
     total_runs = len(configs) * args.repeat
+    print(f"Tag: {tag} | Model: {os.path.basename(model_path)} | "
+          f"Meter: {meter} | Device: {device}")
     print(f"Running {total_runs} benchmarks "
           f"({len(configs)} configs × {args.repeat} repeats) "
           f"on {len(melody)}-note melody")
@@ -173,9 +222,12 @@ def main():
 
             result = run_single(
                 melody, melody_name, model, stoi, itos,
-                meter=METER,
+                meter=meter,
                 temperature=temp,
                 top_k=top_k,
+                tag=tag,
+                device=device,
+                model_path=model_path,
                 seed=seed_counter,
             )
             results.append(result)
@@ -191,7 +243,7 @@ def main():
             f.write(json.dumps(r) + "\n")
     print(f"\nResults written to {args.output}")
 
-    print_summary(results)
+    print_summary(results, tag, model_path, meter, device)
     return 0
 
 
