@@ -17,7 +17,12 @@ Which matches the arranger's mental model: "Given this melody and chord, what ha
 """
 
 import re
+import sys
 from pathlib import Path
+
+# Add tools dir to path for event import
+sys.path.insert(0, str(Path(__file__).parent))
+from event import parse_tokens, format_events
 
 INPUT_FILE = "tools/barbershop_dataset/training_sequences.txt"
 OUTPUT_FILE = "tools/barbershop_dataset/training_sequences_causal.txt"
@@ -84,24 +89,6 @@ def reorder_event_line(event):
     return f"[bar:{bar}] [chord:{chord}] [lead:{lead}] -> [bass:{bass}] [bari:{bari}] [tenor:{tenor}] [dur:{dur}]"
 
 
-def reverse_reorder_event_line(event):
-    """
-    Convert melody-first format back to physical ordering for detokenizer.
-
-    Input (melody-first):  [bar:N] [lead:M] [dur:F] [chord:X] [bass:B] [bari:BA] [tenor:T]
-    Output (physical):     [bar:N] [chord:X] [bass:B] [bari:BA] [lead:M] [tenor:T] [dur:F]
-    """
-    bar = event.get('bar', '?')
-    chord = event.get('chord', 'OTHER')
-    bass = event.get('bass', 'rest')
-    bari = event.get('bari', 'rest')
-    lead = event.get('lead', 'rest')
-    tenor = event.get('tenor', 'rest')
-    dur = event.get('dur', '1.0')
-
-    # Physical order: bar, chord, bass, bari, lead, tenor, dur
-    return f"[bar:{bar}] [chord:{chord}] [bass:{bass}] [bari:{bari}] [lead:{lead}] [tenor:{tenor}] [dur:{dur}]"
-
 
 def reorder_tokens(input_path, output_path):
     """
@@ -155,91 +142,32 @@ def reorder_tokens(input_path, output_path):
 
 def reverse_reorder_tokens(input_path, output_path):
     """
-    Reverse the reordering - convert melody-first back to physical order.
+    Convert any token format to canonical multi-line format.
 
-    This is used to convert harmonizer output (melody-first format)
-    back to the physical format expected by the detokenizer.
+    Uses the canonical Event parser from event.py, which handles all formats
+    (physical, melody-first, single-line, multi-line). Output is always the
+    stable canonical format from format_events().
 
-    Handles both:
-    - Multi-line format: one event per line
-    - Single-line format: all tokens space-separated on one line
+    This replaces the old fragile per-bar grouping approach.
     """
-    print(f"Converting from melody-first to physical order...")
+    print(f"Converting to canonical format...")
     print(f"Reading from: {input_path}")
     print(f"Writing to:   {output_path}")
     print()
 
-    stats = {
-        'header_lines': 0,
-        'event_lines': 0,
-        'song_end_lines': 0,
-    }
-
-    # Read entire file and tokenize
     with open(input_path, 'r') as f:
-        content = f.read()
+        text = f.read()
 
-    # Extract all [token:value] patterns
-    tokens = re.findall(r'\[([a-z_]+):([^\]]+)\]', content)
+    header, events = parse_tokens(text)
 
-    # Build output in phases: headers, events, markers
-    headers = []
-    events = []
-    song_end = False
-    current_event = {}
+    with open(output_path, 'w') as f:
+        f.write(format_events(header, events))
 
-    for token_type, token_value in tokens:
-        if token_type == 'key':
-            # Save any pending event before new header
-            if current_event and 'bar' in current_event:
-                events.append(current_event.copy())
-                current_event = {}
-            headers.append(f'[key:{token_value}]')
-            stats['header_lines'] += 1
-
-        elif token_type == 'meter':
-            headers.append(f'[meter:{token_value}]')
-            stats['header_lines'] += 1
-
-        elif token_type == 'song_end':
-            # Save any pending event before song_end marker
-            if current_event and 'bar' in current_event:
-                events.append(current_event.copy())
-                current_event = {}
-            song_end = True
-            stats['song_end_lines'] += 1
-
-        elif token_type == 'bar':
-            # Starting a new event - save the old one first
-            if current_event and 'bar' in current_event:
-                events.append(current_event.copy())
-            current_event = {'bar': token_value}
-
-        else:
-            # Add token to current event (only for voice/chord/dur tokens)
-            if token_type in ['chord', 'bass', 'bari', 'lead', 'tenor', 'dur']:
-                current_event[token_type] = token_value
-
-    # Save last event
-    if current_event and 'bar' in current_event:
-        events.append(current_event)
-
-    # Write output
-    with open(output_path, 'w') as outfile:
-        # Write headers
-        for header in headers:
-            outfile.write(header + '\n')
-
-        # Write events with reordered tokens
-        for event in events:
-            reversed_line = reverse_reorder_event_line(event)
-            outfile.write(reversed_line + '\n')
-            stats['event_lines'] += 1
-
-        # Write song end marker
-        if song_end:
-            outfile.write('[song_end]\n')
-
+    stats = {
+        'header_lines': 1,
+        'event_lines': len(events),
+        'song_end_lines': 1,
+    }
     return stats
 
 

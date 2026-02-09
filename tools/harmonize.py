@@ -18,10 +18,18 @@ The output is saved to harmonized_output.txt and can be detokenized to MusicXML:
   musescore final_arrangement.xml
 """
 
+import sys
+import os
+from pathlib import Path
+import re
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-import os
+
+# Add tools dir to path for event import
+sys.path.insert(0, str(Path(__file__).parent))
+from event import Header, Event, format_events, quarter_notes_per_bar
 
 # ============================================================================
 # MODEL ARCHITECTURE (Must match train.py exactly)
@@ -578,7 +586,15 @@ def format_duration(dur):
     return dur_str
 
 
-def harmonize_melody(melody_notes, model, stoi, itos):
+def _parse_harmony_token(token: str) -> tuple[str, str] | None:
+    """Extract (type, value) from a token string like '[chord:MAJOR_TRIAD]'."""
+    m = re.match(r'\[([a-z_]+):([^\]]+)\]', token)
+    if m:
+        return m.group(1), m.group(2)
+    return None
+
+
+def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4"):
     """
     Harmonize a melody by feeding notes one-by-one to the model.
 
@@ -587,16 +603,18 @@ def harmonize_melody(melody_notes, model, stoi, itos):
         model: Loaded Transformer model
         stoi: String-to-index vocab dict
         itos: Index-to-string vocab dict
+        meter: Time signature string (e.g., "4/4", "12/8")
 
     Returns:
-        List of tokens (strings)
+        (Header, list[Event])
     """
-    print(f"🎹 Harmonizing {len(melody_notes)}-note melody...")
+    print(f"Harmonizing {len(melody_notes)}-note melody...")
     print()
 
-    # Start with key/meter context (use METER constant)
-    context_tokens = ["[key:C]", f"[meter:{METER}]"]
-    output_tokens = list(context_tokens)
+    header = Header(key="C", meter=meter)
+
+    # Start with key/meter context
+    context_tokens = ["[key:C]", f"[meter:{meter}]"]
 
     # Convert to indices for initial context
     idx = torch.tensor(
@@ -605,24 +623,28 @@ def harmonize_melody(melody_notes, model, stoi, itos):
         device=DEVICE
     ).unsqueeze(0)
 
-    # CRITICAL: Bar tracking uses 4.0 beats regardless of actual meter
-    # This matches the tokenizer bug (line 192 in tokenizer.py: bar_num = int(offset // 4) + 1)
+    # CRITICAL: Bar tracking for MODEL INPUT uses 4.0 beats regardless of actual meter.
+    # This matches the tokenizer bug (line 192 in tokenizer.py: bar_num = int(offset // 4) + 1).
     # The training data has this pattern, so the model expects it.
     # TODO: Fix tokenizer to use actual meter, then retrain model.
-    bar_num = 1
-    beat_in_bar = 0.0
-    beats_per_bar = 4.0
+    model_bar_num = 1
+    model_beat_in_bar = 0.0
+    model_beats_per_bar = 4.0
+
+    # Real offset tracking for Event objects
+    cumulative_offset = 0.0
+    real_qn_per_bar = quarter_notes_per_bar(meter)
+
+    events = []
 
     for i, (pitch, duration) in enumerate(melody_notes, 1):
-        print(f"  Note {i:2d}/{len(melody_notes)}: MIDI {pitch:2d}, dur {duration}")
+        print(f"  Note {i:3d}/{len(melody_notes)}: MIDI {pitch:2d}, dur {duration}")
 
-        # Check if we need a new bar marker
-        if beat_in_bar == 0.0:
-            bar_token = f"[bar:{bar_num}]"
-            if bar_token in stoi:
-                output_tokens.append(bar_token)
-                token_idx = torch.tensor([[stoi[bar_token]]], device=DEVICE)
-                idx = torch.cat((idx, token_idx), dim=1)
+        # Feed [bar:N] token to model for EVERY event
+        bar_token = f"[bar:{model_bar_num}]"
+        if bar_token in stoi:
+            token_idx = torch.tensor([[stoi[bar_token]]], device=DEVICE)
+            idx = torch.cat((idx, token_idx), dim=1)
 
         # 1. FORCE-FEED melody constraint tokens
         constraint_tokens = [
@@ -630,14 +652,28 @@ def harmonize_melody(melody_notes, model, stoi, itos):
             f"[dur:{format_duration(duration)}]"
         ]
 
+        dur_fed = False
         for token in constraint_tokens:
             if token not in stoi:
-                print(f"    ⚠️ Warning: Token '{token}' not in vocab, skipping")
+                print(f"    Warning: Token '{token}' not in vocab, skipping")
+                if token.startswith("[dur:"):
+                    dur_fed = False
                 continue
 
-            output_tokens.append(token)
             token_idx = torch.tensor([[stoi[token]]], device=DEVICE)
             idx = torch.cat((idx, token_idx), dim=1)
+            if token.startswith("[dur:"):
+                dur_fed = True
+
+        # If duration wasn't in vocab, skip this note entirely
+        if not dur_fed:
+            cumulative_offset += duration
+            model_beat_in_bar += duration
+            if model_beat_in_bar >= model_beats_per_bar:
+                model_beat_in_bar -= model_beats_per_bar
+                model_bar_num += 1
+            print()
+            continue
 
         # 2. GENERATE harmony (chord + bass + bari + tenor)
         harmony_tokens = []
@@ -662,7 +698,6 @@ def harmonize_melody(melody_notes, model, stoi, itos):
                 break
 
             # Accept harmony token
-            output_tokens.append(token)
             harmony_tokens.append(token)
             idx = torch.cat((idx, idx_next), dim=1)
 
@@ -676,23 +711,58 @@ def harmonize_melody(melody_notes, model, stoi, itos):
             elif token.startswith("[tenor:"):
                 print(f"      Predicted tenor: {token}")
 
-        # Update bar tracking
-        beat_in_bar += duration
-        if beat_in_bar >= beats_per_bar:
-            beat_in_bar -= beats_per_bar
-            bar_num += 1
+        # 3. BUILD Event from generated tokens
+        real_bar = int(cumulative_offset // real_qn_per_bar) + 1
+
+        # Parse harmony tokens into voice fields
+        chord_val = None
+        bass_val = None
+        bari_val = None
+        tenor_val = None
+
+        for ht in harmony_tokens:
+            parsed = _parse_harmony_token(ht)
+            if parsed is None:
+                continue
+            tt, tv = parsed
+            if tt == 'chord':
+                chord_val = tv
+            elif tt == 'bass':
+                bass_val = int(tv) if tv != 'rest' else None
+            elif tt == 'bari':
+                bari_val = int(tv) if tv != 'rest' else None
+            elif tt == 'tenor':
+                tenor_val = int(tv) if tv != 'rest' else None
+
+        event = Event(
+            bar=real_bar,
+            offset_qn=cumulative_offset,
+            lead=pitch,
+            tenor=tenor_val,
+            bari=bari_val,
+            bass=bass_val,
+            dur=duration,
+            chord=chord_val,
+        )
+        events.append(event)
+
+        # Update tracking
+        cumulative_offset += duration
+        model_beat_in_bar += duration
+        if model_beat_in_bar >= model_beats_per_bar:
+            model_beat_in_bar -= model_beats_per_bar
+            model_bar_num += 1
 
         print()
 
-    # Add end marker
-    output_tokens.append("[song_end]")
-
-    return output_tokens
+    return header, events
 
 
 def main():
+    from collections import Counter
+
     print("=" * 70)
-    print("🎹 BARBERSHOP MELODY HARMONIZER")
+    print("BARBERSHOP MELODY HARMONIZER")
     print("=" * 70)
     print()
 
@@ -701,60 +771,52 @@ def main():
     if model is None:
         return
 
-    print(f"✅ Model loaded from {MODEL_PATH}")
-    print(f"   Vocab size: {len(stoi)}")
-    print(f"   Device: {DEVICE}")
-    print(f"   Meter: {METER}")
+    print(f"Model loaded from {MODEL_PATH}")
+    print(f"  Vocab size: {len(stoi)}")
+    print(f"  Device: {DEVICE}")
+    print(f"  Meter: {METER}")
 
     # Warn about non-4/4 meters
     if METER != "4/4":
         print()
-        print("⚠️  WARNING: Model quality may be poor for non-4/4 meters!")
-        print(f"   Training data: 98.6% are 4/4 (577/585 songs)")
-        print(f"   Only 1 song in 6/8, 5 songs in 3/4")
-        print(f"   Model may generate 4/4-style harmonies even with [meter:{METER}] token")
+        print(f"WARNING: Model quality may be poor for non-4/4 meters!")
+        print(f"  Training data: 98.6% are 4/4 (577/585 songs)")
+        print(f"  Only 1 song in 6/8, 5 songs in 3/4")
+        print(f"  Model may generate 4/4-style harmonies even with [meter:{METER}] token")
         print()
 
     print()
 
-    # Harmonize
-    tokens = harmonize_melody(TEST_MELODY, model, stoi, itos)
+    # Harmonize — returns (Header, list[Event])
+    header, events = harmonize_melody(TEST_MELODY, model, stoi, itos, meter=METER)
+
+    # Serialize to canonical format
+    output_text = format_events(header, events)
+
+    # Save to file
+    with open(OUTPUT_FILE, 'w') as f:
+        f.write(output_text)
 
     # Output results
     print()
     print("=" * 70)
-    print("✅ Harmonization Complete")
+    print("Harmonization Complete")
     print("=" * 70)
     print()
-
-    print("Output tokens:")
-    print("-" * 70)
-    token_str = " ".join(tokens)
-    print(token_str)
-    print()
-
-    # Save to file
-    with open(OUTPUT_FILE, 'w') as f:
-        f.write(token_str)
-
-    print(f"💾 Saved to {OUTPUT_FILE}")
+    print(f"Saved to {OUTPUT_FILE}")
     print()
 
     # Statistics
-    chord_tokens = [t for t in tokens if t.startswith('[chord:')]
-    bar_tokens = [t for t in tokens if t.startswith('[bar:')]
-    print("=" * 70)
+    chord_dist = Counter(e.chord for e in events if e.chord)
     print("Statistics:")
-    print(f"  Total tokens:       {len(tokens)}")
-    print(f"  Bars:               {len(bar_tokens)}")
-    print(f"  Chord predictions:  {len(chord_tokens)}")
-    if chord_tokens:
-        from collections import Counter
-        chord_dist = Counter(chord_tokens)
+    print(f"  Events:             {len(events)}")
+    print(f"  Melody notes input: {len(TEST_MELODY)}")
+    if chord_dist:
         print()
         print("  Chord Distribution:")
         for chord, count in chord_dist.most_common():
-            print(f"    {chord:<25} : {count}")
+            pct = 100.0 * count / len(events)
+            print(f"    {chord:<25} : {count} ({pct:.1f}%)")
     print()
 
     # Next steps
