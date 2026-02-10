@@ -550,7 +550,7 @@ def build_token_masks(stoi, device='cpu', voice_ranges=None):
     return masks
 
 
-def build_logit_biases(token_masks, stoi, itos, bias_dict, device='cpu'):
+def build_logit_biases(token_masks, itos, bias_dict, device='cpu'):
     """Precompute logit bias tensors aligned to each prefix's allowed_idx.
 
     Returns dict mapping prefix → bias tensor (same length as allowed_idx),
@@ -585,6 +585,11 @@ def constrained_sample(model, idx, allowed_idx, itos,
     """
     for attempt in range(max_retries):
         t = temperature * (1.0 + 0.5 * attempt)  # ramp: T → 1.5T → 2T
+
+        # Bump temperature when allowed set is very small to avoid repetition
+        n_allowed = allowed_idx.size(0)
+        if n_allowed <= 4:
+            t = max(t, 1.0)
 
         idx_cond = idx[:, -model.block_size:]
         logits, _ = model(idx_cond)
@@ -642,6 +647,32 @@ def _precompute_allowed_midis(allowed_idx, itos):
     return midis
 
 
+def _append_fallback_token(token_type, idx, stoi, token_masks, itos, device):
+    """Append a rest (or first-allowed) token to keep the grammar aligned.
+
+    The model expects exactly one token per slot in the sequence
+    ``[bar][lead][dur][chord][bass][bari][tenor]``.  When sampling fails,
+    this injects a valid placeholder so downstream slots see correct context.
+    """
+    rest_tok = f"[{token_type}:rest]"
+    if rest_tok in stoi:
+        tok_idx = torch.tensor([[stoi[rest_tok]]], device=device)
+        return torch.cat((idx, tok_idx), dim=1), rest_tok
+
+    _mask, allowed_idx = token_masks[token_type]
+    # Try any token ending in :rest]
+    for vidx in allowed_idx.tolist():
+        tok = itos[vidx]
+        if tok.endswith(":rest]"):
+            tok_idx = torch.tensor([[vidx]], device=device)
+            return torch.cat((idx, tok_idx), dim=1), tok
+
+    # Last resort: first allowed token (keeps grammar alignment)
+    vidx = allowed_idx[0].item()
+    tok_idx = torch.tensor([[vidx]], device=device)
+    return torch.cat((idx, tok_idx), dim=1), itos[vidx]
+
+
 def filter_allowed_by_pitch(allowed_idx, midis, lo=None, hi=None):
     """Return subset of *allowed_idx* whose MIDI pitches fall within [lo, hi].
 
@@ -651,7 +682,6 @@ def filter_allowed_by_pitch(allowed_idx, midis, lo=None, hi=None):
     ordering constraints.
     """
     is_rest = midis == -1
-    is_nonpitch = midis == -2
     in_range = torch.ones(midis.size(0), dtype=torch.bool, device=midis.device)
     pitched = (midis >= 0)
     if lo is not None:
@@ -659,9 +689,8 @@ def filter_allowed_by_pitch(allowed_idx, midis, lo=None, hi=None):
     if hi is not None:
         in_range &= (midis <= hi) | ~pitched
 
-    keep = in_range | is_rest | is_nonpitch
-    if keep.any():
-        return allowed_idx[keep]
+    if in_range.any():
+        return allowed_idx[in_range]
 
     # Pitch window too tight — fall back to rest-only
     if is_rest.any():
@@ -712,7 +741,7 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4", quiet=False,
         allowed_midis[prefix] = _precompute_allowed_midis(aidx, itos)
 
     # Precompute logit bias tensors
-    logit_biases = build_logit_biases(token_masks, stoi, itos, chord_biases, device=DEVICE)
+    logit_biases = build_logit_biases(token_masks, itos, chord_biases, device=DEVICE)
     if logit_biases:
         _log(f"  Logit biases active for: {', '.join(logit_biases.keys())}")
     _log()
@@ -750,120 +779,122 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4", quiet=False,
         for i, (pitch, duration) in enumerate(melody_notes, 1):
             _log(f"  Note {i:3d}/{len(melody_notes)}: MIDI {pitch:2d}, dur {duration}")
 
-            # Feed [bar:N] token to model for EVERY event
+            # 1. VALIDATE constraint tokens BEFORE appending anything to idx
+            dur_str = _quantize_duration(duration, stoi)
+            if dur_str != format_duration(duration):
+                _log(f"    Quantized dur {format_duration(duration)} → {dur_str}")
+
+            lead_tok = f"[lead:{pitch}]"
+            dur_tok = f"[dur:{dur_str}]"
+
+            if lead_tok not in stoi or dur_tok not in stoi:
+                _log(f"    Warning: missing token(s) lead={lead_tok in stoi}"
+                     f" dur={dur_tok in stoi}; skipping note")
+                cumulative_offset += duration
+                model_beat_in_bar += duration
+                while model_beat_in_bar + 1e-9 >= model_beats_per_bar:
+                    model_beat_in_bar -= model_beats_per_bar
+                    model_bar_num += 1
+                _log()
+                continue
+
+            # 2. APPEND [bar:N] — safe now that we know lead/dur are valid
             bar_token = f"[bar:{model_bar_num}]"
             if bar_token in stoi:
                 token_idx = torch.tensor([[stoi[bar_token]]], device=DEVICE)
                 idx = torch.cat((idx, token_idx), dim=1)
 
-            # 1. FORCE-FEED melody constraint tokens
-            dur_str = _quantize_duration(duration, stoi)
-            if dur_str != format_duration(duration):
-                _log(f"    Quantized dur {format_duration(duration)} → {dur_str}")
-
-            constraint_tokens = [
-                f"[lead:{pitch}]",
-                f"[dur:{dur_str}]"
-            ]
-
-            for token in constraint_tokens:
-                if token not in stoi:
-                    _log(f"    Warning: Token '{token}' not in vocab, skipping note")
-                    break
-                token_idx = torch.tensor([[stoi[token]]], device=DEVICE)
+            # 3. FORCE-FEED melody constraint tokens
+            for tok in (lead_tok, dur_tok):
+                token_idx = torch.tensor([[stoi[tok]]], device=DEVICE)
                 idx = torch.cat((idx, token_idx), dim=1)
-            else:
-                # All constraint tokens fed successfully — generate harmony
-                chord_val = None
-                bass_val = None
-                bari_val = None
-                tenor_val = None
 
-                # 2. GENERATE harmony: chord → bass → bari → tenor (constrained)
-                #
-                # Dynamic pitch guards:
-                #   Non-adjacent crossing prevention (hard):
-                #     bass ≤ lead, bari ≥ bass, tenor ≥ max(bass, bari)
-                #   Spacing limits (soft, for musicality):
-                #     bari-bass ≤ 19,  |tenor-lead| ≤ 12
-                _MAX_BARI_BASS = 19
-                _MAX_TENOR_LEAD = 12
+            # 4. GENERATE harmony: chord → bass → bari → tenor (constrained)
+            #
+            # Dynamic pitch guards:
+            #   Non-adjacent crossing prevention (hard):
+            #     bass ≤ lead, bari ≥ bass, tenor ≥ max(bass, bari)
+            #   Spacing limits (soft, for musicality):
+            #     bari-bass ≤ 19,  |tenor-lead| ≤ 12
+            chord_val = None
+            bass_val = None
+            bari_val = None
+            tenor_val = None
+            _MAX_BARI_BASS = 19
+            _MAX_TENOR_LEAD = 12
 
-                for token_type in _GENERATION_ORDER:
-                    _mask, allowed_idx = token_masks[token_type]
-                    midis = allowed_midis[token_type]
+            for token_type in _GENERATION_ORDER:
+                _mask, allowed_idx = token_masks[token_type]
+                midis = allowed_midis[token_type]
 
-                    if token_type == 'bass' and pitch is not None:
+                if token_type == 'bass' and pitch is not None:
+                    allowed_idx = filter_allowed_by_pitch(
+                        allowed_idx, midis, hi=pitch)
+                elif token_type == 'bari':
+                    lo = bass_val
+                    hi = (bass_val + _MAX_BARI_BASS) if bass_val is not None else None
+                    if lo is not None or hi is not None:
                         allowed_idx = filter_allowed_by_pitch(
-                            allowed_idx, midis, hi=pitch)
-                    elif token_type == 'bari':
-                        lo = bass_val
-                        hi = (bass_val + _MAX_BARI_BASS) if bass_val is not None else None
-                        if lo is not None or hi is not None:
-                            allowed_idx = filter_allowed_by_pitch(
-                                allowed_idx, midis, lo=lo, hi=hi)
-                    elif token_type == 'tenor':
-                        # Non-adjacent: tenor ≥ max(bass, bari)
-                        lo_bound = max(
-                            v for v in (bass_val, bari_val) if v is not None
-                        ) if any(v is not None for v in (bass_val, bari_val)) else None
-                        # Spacing: within 12 of lead
-                        if pitch is not None:
-                            lo_t = pitch - _MAX_TENOR_LEAD
-                            hi_t = pitch + _MAX_TENOR_LEAD
-                            if lo_bound is not None:
-                                lo_t = max(lo_t, lo_bound)
-                            allowed_idx = filter_allowed_by_pitch(
-                                allowed_idx, midis, lo=lo_t, hi=hi_t)
-                        elif lo_bound is not None:
-                            allowed_idx = filter_allowed_by_pitch(
-                                allowed_idx, midis, lo=lo_bound)
+                            allowed_idx, midis, lo=lo, hi=hi)
+                elif token_type == 'tenor':
+                    lo_bound = max(
+                        v for v in (bass_val, bari_val) if v is not None
+                    ) if any(v is not None for v in (bass_val, bari_val)) else None
+                    if pitch is not None:
+                        lo_t = pitch - _MAX_TENOR_LEAD
+                        hi_t = pitch + _MAX_TENOR_LEAD
+                        if lo_bound is not None:
+                            lo_t = max(lo_t, lo_bound)
+                        allowed_idx = filter_allowed_by_pitch(
+                            allowed_idx, midis, lo=lo_t, hi=hi_t)
+                    elif lo_bound is not None:
+                        allowed_idx = filter_allowed_by_pitch(
+                            allowed_idx, midis, lo=lo_bound)
 
-                    bias = logit_biases.get(token_type)
-                    token, idx = constrained_sample(
-                        model, idx, allowed_idx, itos,
-                        temperature=temperature, top_k=top_k,
-                        logit_bias=bias
-                    )
-
-                    if token is None:
-                        _log(f"      {token_type:5s}: FAILED (all retries exhausted, using rest)")
-                        # Explicitly leave *_val as None (rest) so downstream
-                        # pitch guards see correct state for this event.
-                        continue
-
-                    parsed = _parse_harmony_token(token)
-                    if parsed is None:
-                        continue
-                    tt, tv = parsed
-
-                    if tt == 'chord':
-                        chord_val = tv
-                        _log(f"      Predicted chord: {token}")
-                    elif tt == 'bass':
-                        bass_val = int(tv) if tv != 'rest' else None
-                        _log(f"      Predicted bass:  {token}")
-                    elif tt == 'bari':
-                        bari_val = int(tv) if tv != 'rest' else None
-                        _log(f"      Predicted bari:  {token}")
-                    elif tt == 'tenor':
-                        tenor_val = int(tv) if tv != 'rest' else None
-                        _log(f"      Predicted tenor: {token}")
-
-                # 3. BUILD Event from generated tokens
-                real_bar = int(cumulative_offset // real_qn_per_bar) + 1
-
-                event = Event(
-                    bar=real_bar,
-                    offset_qn=cumulative_offset,
-                    lead=pitch,
-                    tenor=tenor_val,
-                    bari=bari_val,
-                    bass=bass_val,
-                    dur=duration,
-                    chord=chord_val,
+                bias = logit_biases.get(token_type)
+                token, idx = constrained_sample(
+                    model, idx, allowed_idx, itos,
+                    temperature=temperature, top_k=top_k,
+                    logit_bias=bias
                 )
-                events.append(event)
+
+                if token is None:
+                    _log(f"      {token_type:5s}: FAILED — forcing rest to keep grammar aligned")
+                    idx, token = _append_fallback_token(
+                        token_type, idx, stoi, token_masks, itos, DEVICE)
+
+                parsed = _parse_harmony_token(token)
+                if parsed is None:
+                    continue
+                tt, tv = parsed
+
+                if tt == 'chord':
+                    chord_val = tv
+                    _log(f"      Predicted chord: {token}")
+                elif tt == 'bass':
+                    bass_val = int(tv) if tv != 'rest' else None
+                    _log(f"      Predicted bass:  {token}")
+                elif tt == 'bari':
+                    bari_val = int(tv) if tv != 'rest' else None
+                    _log(f"      Predicted bari:  {token}")
+                elif tt == 'tenor':
+                    tenor_val = int(tv) if tv != 'rest' else None
+                    _log(f"      Predicted tenor: {token}")
+
+            # 5. BUILD Event from generated tokens
+            real_bar = int(cumulative_offset // real_qn_per_bar) + 1
+
+            event = Event(
+                bar=real_bar,
+                offset_qn=cumulative_offset,
+                lead=pitch,
+                tenor=tenor_val,
+                bari=bari_val,
+                bass=bass_val,
+                dur=duration,
+                chord=chord_val,
+            )
+            events.append(event)
 
             # Update tracking
             cumulative_offset += duration
