@@ -584,7 +584,7 @@ def constrained_sample(model, idx, allowed_idx, itos,
     Returns (token_string, updated_idx) or (None, idx) if all retries fail.
     """
     for attempt in range(max_retries):
-        t = temperature * (1.0 + 0.5 * attempt)  # ramp: 0.8 → 1.2 → 1.6
+        t = temperature * (1.0 + 0.5 * attempt)  # ramp: T → 1.5T → 2T
 
         idx_cond = idx[:, -model.block_size:]
         logits, _ = model(idx_cond)
@@ -618,32 +618,57 @@ def constrained_sample(model, idx, allowed_idx, itos,
     return None, idx
 
 
-def filter_allowed_by_pitch(allowed_idx, itos, lo=None, hi=None):
-    """Return subset of allowed_idx whose MIDI pitches fall within [lo, hi].
+def _precompute_allowed_midis(allowed_idx, itos):
+    """Build a tensor of MIDI values aligned with *allowed_idx*.
 
-    Rest tokens (value 'rest') are always kept.  *lo*/*hi* of None means
-    unbounded in that direction.
+    Returns int16 tensor: actual MIDI pitch, -1 for rest, -2 for non-pitch
+    tokens (e.g. chord labels).  Called once per prefix at startup.
     """
-    keep = []
-    for i in range(allowed_idx.size(0)):
-        tok = itos[allowed_idx[i].item()]
-        parsed = _parse_harmony_token(tok)
+    midis = torch.empty(allowed_idx.size(0), dtype=torch.int16,
+                        device=allowed_idx.device)
+    for i, vidx in enumerate(allowed_idx.tolist()):
+        parsed = _parse_harmony_token(itos[vidx])
         if parsed is None:
-            keep.append(i)
-            continue
-        _typ, val = parsed
-        if val == 'rest':
-            keep.append(i)
-            continue
-        midi = int(val)
-        if lo is not None and midi < lo:
-            continue
-        if hi is not None and midi > hi:
-            continue
-        keep.append(i)
-    if not keep:
-        return allowed_idx  # safety: don't return empty
-    return allowed_idx[torch.tensor(keep, device=allowed_idx.device)]
+            midis[i] = -2
+        else:
+            _, v = parsed
+            if v == 'rest':
+                midis[i] = -1
+            else:
+                try:
+                    midis[i] = int(v)
+                except ValueError:
+                    midis[i] = -2  # non-pitch token (e.g. chord label)
+    return midis
+
+
+def filter_allowed_by_pitch(allowed_idx, midis, lo=None, hi=None):
+    """Return subset of *allowed_idx* whose MIDI pitches fall within [lo, hi].
+
+    *midis* is the precomputed int16 tensor from ``_precompute_allowed_midis``.
+    Rest (-1) and non-pitch (-2) tokens are always kept.  When the filter
+    eliminates all pitched tokens, falls back to rest-only to preserve hard
+    ordering constraints.
+    """
+    is_rest = midis == -1
+    is_nonpitch = midis == -2
+    in_range = torch.ones(midis.size(0), dtype=torch.bool, device=midis.device)
+    pitched = (midis >= 0)
+    if lo is not None:
+        in_range &= (midis >= lo) | ~pitched
+    if hi is not None:
+        in_range &= (midis <= hi) | ~pitched
+
+    keep = in_range | is_rest | is_nonpitch
+    if keep.any():
+        return allowed_idx[keep]
+
+    # Pitch window too tight — fall back to rest-only
+    if is_rest.any():
+        return allowed_idx[is_rest]
+
+    # Last resort (should be unreachable with well-formed vocab)
+    return allowed_idx
 
 
 def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4", quiet=False,
@@ -662,8 +687,6 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4", quiet=False,
         temperature: Sampling temperature (lower = more deterministic)
         top_k: Restrict sampling to top-k tokens within allowed set
         chord_biases: Dict of token string → bias value, or None to disable
-        temperature: Sampling temperature (lower = more deterministic)
-        top_k: Restrict sampling to top-k tokens within allowed set
 
     Returns:
         (Header, list[Event])
@@ -682,8 +705,11 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4", quiet=False,
         'tenor': (46, 69),
     }
     token_masks = build_token_masks(stoi, device=DEVICE, voice_ranges=voice_ranges)
+    # Precompute MIDI pitch tensors for vectorized filtering
+    allowed_midis = {}
     for prefix, (mask, aidx) in token_masks.items():
         _log(f"  Token mask [{prefix}:*]: {int(mask.sum().item())} allowed tokens")
+        allowed_midis[prefix] = _precompute_allowed_midis(aidx, itos)
 
     # Precompute logit bias tensors
     logit_biases = build_logit_biases(token_masks, stoi, itos, chord_biases, device=DEVICE)
@@ -765,16 +791,17 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4", quiet=False,
 
                 for token_type in _GENERATION_ORDER:
                     _mask, allowed_idx = token_masks[token_type]
+                    midis = allowed_midis[token_type]
 
                     if token_type == 'bass' and pitch is not None:
                         allowed_idx = filter_allowed_by_pitch(
-                            allowed_idx, itos, hi=pitch)
+                            allowed_idx, midis, hi=pitch)
                     elif token_type == 'bari':
                         lo = bass_val
                         hi = (bass_val + _MAX_BARI_BASS) if bass_val is not None else None
                         if lo is not None or hi is not None:
                             allowed_idx = filter_allowed_by_pitch(
-                                allowed_idx, itos, lo=lo, hi=hi)
+                                allowed_idx, midis, lo=lo, hi=hi)
                     elif token_type == 'tenor':
                         # Non-adjacent: tenor ≥ max(bass, bari)
                         lo_bound = max(
@@ -787,10 +814,10 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4", quiet=False,
                             if lo_bound is not None:
                                 lo_t = max(lo_t, lo_bound)
                             allowed_idx = filter_allowed_by_pitch(
-                                allowed_idx, itos, lo=lo_t, hi=hi_t)
+                                allowed_idx, midis, lo=lo_t, hi=hi_t)
                         elif lo_bound is not None:
                             allowed_idx = filter_allowed_by_pitch(
-                                allowed_idx, itos, lo=lo_bound)
+                                allowed_idx, midis, lo=lo_bound)
 
                     bias = logit_biases.get(token_type)
                     token, idx = constrained_sample(
@@ -801,6 +828,8 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4", quiet=False,
 
                     if token is None:
                         _log(f"      {token_type:5s}: FAILED (all retries exhausted, using rest)")
+                        # Explicitly leave *_val as None (rest) so downstream
+                        # pitch guards see correct state for this event.
                         continue
 
                     parsed = _parse_harmony_token(token)
@@ -839,7 +868,7 @@ def harmonize_melody(melody_notes, model, stoi, itos, meter="4/4", quiet=False,
             # Update tracking
             cumulative_offset += duration
             model_beat_in_bar += duration
-            if model_beat_in_bar >= model_beats_per_bar:
+            while model_beat_in_bar + 1e-9 >= model_beats_per_bar:
                 model_beat_in_bar -= model_beats_per_bar
                 model_bar_num += 1
 
